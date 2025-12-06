@@ -1,0 +1,254 @@
+-- Root DAO Contract for Decentralized Lending Protocol
+-- Daml 2.10.2 Compatible
+-- Canton Network Hackathon Project
+
+module LendingProtocol.Root where
+
+import DA.Map (Map)
+import qualified DA.Map as Map
+import DA.Set (Set)
+import qualified DA.Set as Set
+
+-- | Configuration for the entire protocol
+data ProtocolConfig = ProtocolConfig
+  with
+    daoFeePercentage : Decimal  -- DAO fee on top of loan interest (e.g., 0.5%)
+    reportingPeriodDays : Int   -- Period for regulatory reports (e.g., 30 for monthly)
+  deriving (Eq, Show)
+
+-- | Status of a bank in the system
+data BankStatus = 
+    Active      -- Bank is actively operating
+  | Suspended   -- Bank temporarily suspended
+  | Terminated  -- Bank permanently removed
+  deriving (Eq, Show)
+
+-- | Information about an invited bank
+data BankInfo = BankInfo
+  with
+    bankId : Party
+    bankName : Text
+    invitedAt : Time
+    status : BankStatus
+  deriving (Eq, Show)
+
+-- | Root contract controlled by the DAO
+-- This is the source of truth for the entire protocol
+template ProtocolRoot
+  with
+    dao : Party                           -- The DAO controlling the protocol
+    config : ProtocolConfig               -- Protocol-wide configuration
+    invitedBanks : Map Party BankInfo     -- All banks in the system
+    protocolVersion : Text                -- Version for future upgrades
+  where
+    signatory dao
+    
+    -- Ensure DAO fee is reasonable (between 0 and 5%)
+    ensure config.daoFeePercentage >= 0.0 && config.daoFeePercentage <= 5.0
+    
+    key dao : Party
+    maintainer key
+    
+    -- | DAO invites a new bank to participate in the protocol
+    nonconsuming choice InviteBank : ContractId BankInvitation
+      with
+        bankId : Party
+        bankName : Text
+      controller dao
+      do
+        -- Ensure bank isn't already invited
+        assertMsg "Bank already invited" $ not (Map.member bankId invitedBanks)
+        
+        now <- getTime
+        
+        -- Create invitation for the bank to accept
+        create BankInvitation
+          with
+            dao
+            bankId
+            bankName
+            config
+            invitedAt = now
+            protocolRootCid = self
+    
+    -- | DAO updates protocol configuration
+    choice UpdateProtocolConfig : ContractId ProtocolRoot
+      with
+        newConfig : ProtocolConfig
+      controller dao
+      do
+        create this with config = newConfig
+    
+    -- | DAO suspends a bank
+    choice SuspendBank : ContractId ProtocolRoot
+      with
+        bankId : Party
+      controller dao
+      do
+        case Map.lookup bankId invitedBanks of
+          None -> abort "Bank not found"
+          Some bankInfo -> do
+            let updatedInfo = bankInfo with status = Suspended
+            create this with invitedBanks = Map.insert bankId updatedInfo invitedBanks
+    
+    -- | DAO reactivates a suspended bank
+    choice ReactivateBank : ContractId ProtocolRoot
+      with
+        bankId : Party
+      controller dao
+      do
+        case Map.lookup bankId invitedBanks of
+          None -> abort "Bank not found"
+          Some bankInfo -> do
+            assertMsg "Bank is not suspended" $ bankInfo.status == Suspended
+            let updatedInfo = bankInfo with status = Active
+            create this with invitedBanks = Map.insert bankId updatedInfo invitedBanks
+    
+    -- | DAO terminates a bank permanently
+    choice TerminateBank : ContractId ProtocolRoot
+      with
+        bankId : Party
+      controller dao
+      do
+        case Map.lookup bankId invitedBanks of
+          None -> abort "Bank not found"
+          Some bankInfo -> do
+            let updatedInfo = bankInfo with status = Terminated
+            create this with invitedBanks = Map.insert bankId updatedInfo invitedBanks
+    
+    -- | Non-consuming choice to query bank status
+    nonconsuming choice GetBankInfo : Optional BankInfo
+      with
+        bankId : Party
+      controller dao
+      do
+        return $ Map.lookup bankId invitedBanks
+
+-- | Invitation contract sent to a bank
+-- Bank must accept this to gain access to their subtree
+template BankInvitation
+  with
+    dao : Party
+    bankId : Party
+    bankName : Text
+    config : ProtocolConfig
+    invitedAt : Time
+    protocolRootCid : ContractId ProtocolRoot
+  where
+    signatory dao
+    observer bankId
+    
+    -- | Bank accepts the invitation and gains access to the protocol
+    choice AcceptInvitation : ContractId BankSubtree
+      controller bankId
+      do
+        -- Create the bank's subtree - this is their operational space
+        -- Bank info is already stored in ProtocolRoot when invitation was created
+        create BankSubtree
+          with
+            dao
+            bank = bankId
+            bankName
+            config
+            regulators = Set.empty
+            activePools = Set.empty
+            joinedAt = invitedAt
+            isActive = True
+    
+    -- | Bank declines the invitation
+    choice DeclineInvitation : ()
+      controller bankId
+      do
+        return ()
+
+-- | Bank's operational subtree - this is where all bank operations happen
+-- Each bank has full control over their subtree
+template BankSubtree
+  with
+    dao : Party                      -- Reference to DAO
+    bank : Party                     -- The bank party
+    bankName : Text                  -- Bank's name
+    config : ProtocolConfig          -- Protocol configuration
+    regulators : Set Party           -- Regulators invited by this bank
+    activePools : Set Text           -- Track active pool IDs
+    joinedAt : Time                  -- When bank joined
+    isActive : Bool                  -- Whether bank is currently active
+  where
+    signatory dao, bank
+    observer regulators
+    
+    key (dao, bank) : (Party, Party)
+    maintainer key._2
+    
+    -- | Register that a pool was created (called after DAO approval)
+    choice RegisterPoolCreation : ContractId BankSubtree
+      with
+        poolId : Text
+      controller dao
+      do
+        assertMsg "Bank is not active" isActive
+        assertMsg "Pool ID already exists" $ not (Set.member poolId activePools)
+        
+        create this with
+          activePools = Set.insert poolId activePools
+    
+    -- | Remove a closed pool from tracking
+    choice UnregisterPool : ContractId BankSubtree
+      with
+        poolId : Text
+      controller bank
+      do
+        assertMsg "Pool not found" $ Set.member poolId activePools
+        
+        create this with
+          activePools = Set.delete poolId activePools
+    
+    -- | Bank invites a regulator to observe their operations
+    choice InviteRegulator : ContractId BankSubtree
+      with
+        regulator : Party
+      controller bank
+      do
+        assertMsg "Bank is not active" isActive
+        assertMsg "Regulator already invited" $ not (Set.member regulator regulators)
+        create this with regulators = Set.insert regulator regulators
+    
+    -- | Bank removes a regulator
+    choice RemoveRegulator : ContractId BankSubtree
+      with
+        regulator : Party
+      controller bank
+      do
+        assertMsg "Regulator not found" $ Set.member regulator regulators
+        create this with regulators = Set.delete regulator regulators
+    
+    -- | DAO can deactivate a bank (emergency measure)
+    choice DeactivateBank : ContractId BankSubtree
+      controller dao
+      do
+        create this with isActive = False
+    
+    -- | DAO can reactivate a bank
+    choice ReactivateSubtree : ContractId BankSubtree
+      controller dao
+      do
+        create this with isActive = True
+    
+    -- | Non-consuming choice to verify bank is active
+    nonconsuming choice VerifyActive : Bool
+      controller bank
+      do
+        return isActive
+
+-- | Helper function to create initial protocol root
+createInitialProtocol : Party -> Decimal -> Int -> Update (ContractId ProtocolRoot)
+createInitialProtocol dao feePercentage reportingDays = do
+  create ProtocolRoot
+    with
+      dao
+      config = ProtocolConfig
+        with
+          daoFeePercentage = feePercentage
+          reportingPeriodDays = reportingDays
+      invitedBanks = Map.empty
+      protocolVersion = "1.0.0-MVP"

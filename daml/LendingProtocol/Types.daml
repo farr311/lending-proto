@@ -1,0 +1,126 @@
+-- Common Types for Decentralized Lending Protocol
+-- Daml 2.10.2 Compatible
+-- Canton Network Hackathon Project
+
+module LendingProtocol.Types where
+
+import DA.Map (Map)
+
+-- | Status of a lending pool
+data PoolStatus = 
+    Open        -- Pool is accepting investments and loans
+  | Closing     -- Pool is winding down, no new activity
+  | Closed      -- Pool is fully closed and archived
+  deriving (Eq, Show)
+
+-- | KYC verification status
+data KycStatus = 
+    KycPending      -- KYC not yet performed
+  | KycApproved     -- KYC passed
+  | KycRejected     -- KYC failed
+  deriving (Eq, Show)
+
+-- | Category determines WHEN rules are validated
+data RuleCategory = 
+    ParticipationRules    -- Who can participate in any role
+  | InvestmentRules       -- Investment constraints
+  | BorrowingRules        -- Borrowing constraints
+  | WithdrawalRules       -- Withdrawal constraints
+  deriving (Eq, Show, Ord)
+
+-- | Role of a party in the system
+data PartyRole = 
+    Borrower
+  | Investor
+  | Liquidator
+  | AnyRole               -- Rule applies to any role
+  deriving (Eq, Show)
+
+-- | Specific rule types with their parameters
+data RuleType =
+  -- PARTICIPATION RULES
+    BlacklistedParty with party : Party
+  | WhitelistedPartiesOnly with parties : [Party]
+  | RequireKyc
+  | MinimumCreditScoreForRole with role : PartyRole; minScore : Int
+  
+  -- INVESTMENT RULES
+  | MinimumInvestmentAmount with amount : Decimal
+  | MaximumInvestmentPerParty with amount : Decimal
+  | AllowedInvestmentAssets with assets : [Text]
+  
+  -- BORROWING RULES
+  | MinimumCollateralRatio with ratio : Decimal         -- e.g., 1.2 = 120%
+  | AllowedBorrowAssets with assets : [Text]            -- e.g., ["USDT"]
+  | MinimumLoanAmount with amount : Decimal
+  | MaximumLoanAmount with amount : Decimal
+  | MinimumLoanTermDays with days : Int                 -- e.g., 90 days minimum
+  | MaximumLoanTermDays with days : Int                 -- e.g., 3650 days (10 years)
+  | MinimumInterestRate with rate : Decimal             -- e.g., 0.03 = 3% APR
+  | MaximumInterestRate with rate : Decimal             -- e.g., 0.15 = 15% APR
+  
+  -- WITHDRAWAL RULES
+  | AnnualDistributionOnly                              -- No mid-term withdrawals
+  
+  deriving (Eq, Show)
+
+-- | A rule with metadata
+data Rule = Rule
+  with
+    ruleId : Text              -- Unique identifier: "kyc-requirement-1"
+    category : RuleCategory
+    ruleType : RuleType
+    enabled : Bool
+    description : Text
+    createdAt : Time
+    updatedAt : Time
+  deriving (Eq, Show)
+
+-- | Context provided for validation - depends on the action being validated
+data ValidationContext = 
+    ParticipationContext
+      with
+        participant : Party
+        role : PartyRole
+        kycVerified : Bool
+        creditScore : Optional Int
+  
+  | InvestmentContext
+      with
+        investor : Party
+        investmentAmount : Decimal
+        assetType : Text
+        currentTotalInvestment : Optional Decimal  -- Party's existing investment in pool
+  
+  | BorrowingContext
+      with
+        borrower : Party
+        kycVerified : Bool
+        creditScore : Optional Int
+        loanAmount : Decimal
+        collateralValue : Decimal
+        loanTermDays : Int
+        interestRate : Decimal
+        assetType : Text
+  
+  | WithdrawalContext
+      with
+        withdrawer : Party
+        withdrawalAmount : Decimal
+        timeSinceInvestment : Int  -- Days since investment
+  
+  deriving (Eq, Show)
+
+-- | Type alias for organized rule storage
+type RulesByCategory = Map RuleCategory [Rule]
+
+-- | Helper to check if a list contains a value (since DA.List.elem might not work as expected)
+contains : Eq a => a -> [a] -> Bool
+contains x xs = any (\y -> x == y) xs
+
+-- | Helper to find first Left in a list of Either values
+findLeft : [Either a b] -> Optional (Either a b)
+findLeft [] = None
+findLeft (x :: xs) = case x of
+  Left _ -> Some x
+  Right _ -> findLeft xs

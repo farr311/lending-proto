@@ -1,0 +1,342 @@
+-- Regulatory Reporting System
+-- Daml 2.10.2 Compatible
+-- Canton Network Hackathon Project
+
+module LendingProtocol.Regulator where
+
+import DA.Set (Set)
+import qualified DA.Set as Set
+import qualified DA.Time as T
+import LendingProtocol.Borrower.Loan (LoanStatus)
+
+-- ============================================================================
+-- REGULATORY REPORT
+-- ============================================================================
+
+-- | Report status
+data ReportStatus = 
+    Pending           -- Generated, awaiting regulator review
+  | Acknowledged      -- Regulator has reviewed
+  | Flagged           -- Regulator found issues
+  deriving (Eq, Show)
+
+-- | Comprehensive regulatory report for a lending pool
+template RegulatoryReport
+  with
+    dao : Party
+    bank : Party
+    regulators : Set Party        -- All regulators for this pool
+    poolId : Text
+    reportPeriod : Text           -- "2025-01", "2025-Q1", etc.
+    reportGeneratedAt : Time
+    
+    -- Loan portfolio metrics
+    totalActiveLoans : Int
+    totalLoanVolume : Decimal
+    totalDefaultedLoans : Int
+    totalDefaultedVolume : Decimal
+    averageLoanSize : Decimal
+    averageInterestRate : Decimal
+    
+    -- Compliance metrics
+    kycComplianceRate : Decimal   -- % of loans with KYC
+    totalKycVerified : Int
+    totalKycPending : Int
+    totalKycRejected : Int
+    
+    -- Risk metrics
+    averageCreditScore : Optional Decimal
+    averageCollateralRatio : Decimal
+    loansAtRisk : Int             -- Loans approaching liquidation
+    
+    -- Financial metrics
+    totalInterestCollected : Decimal
+    totalPrincipalRepaid : Decimal
+    daoFeesCollected : Decimal
+    outstandingPrincipal : Decimal
+    
+    -- Investor metrics
+    totalInvestors : Int
+    totalInvestedCapital : Decimal
+    
+    reportStatus : ReportStatus
+    acknowledgedBy : Optional Party
+    regulatorNotes : Optional Text
+  where
+    signatory dao, bank
+    observer regulators
+    
+    key (dao, bank, poolId, reportPeriod) : (Party, Party, Text, Text)
+    maintainer key._2
+    
+    -- | Regulator acknowledges report
+    choice AcknowledgeReport : ContractId RegulatoryReport
+      with
+        regulator : Party
+        notes : Optional Text
+      controller regulator
+      do
+        assertMsg "Regulator not authorized" $ Set.member regulator regulators
+        assertMsg "Report already acknowledged" $ reportStatus == Pending
+        
+        create this with
+          reportStatus = Acknowledged
+          acknowledgedBy = Some regulator
+          regulatorNotes = notes
+    
+    -- | Regulator flags report for issues
+    choice FlagReport : ContractId RegulatoryReport
+      with
+        regulator : Party
+        issues : Text
+      controller regulator
+      do
+        assertMsg "Regulator not authorized" $ Set.member regulator regulators
+        
+        create this with
+          reportStatus = Flagged
+          acknowledgedBy = Some regulator
+          regulatorNotes = Some issues
+    
+    -- | Bank responds to flagged report
+    choice RespondToFlag : ContractId RegulatoryReport
+      with
+        response : Text
+      controller bank
+      do
+        assertMsg "Report not flagged" $ reportStatus == Flagged
+        
+        -- In real implementation, would create a response thread
+        -- For MVP, just update notes
+        let updatedNotes = case regulatorNotes of
+              None -> Some response
+              Some existing -> Some $ existing <> "\n\nBank Response: " <> response
+        
+        create this with
+          regulatorNotes = updatedNotes
+
+-- ============================================================================
+-- REPORT GENERATION TRIGGER
+-- ============================================================================
+
+-- | Report generation tracker - attached to LendingPool
+-- Tracks when next report is due
+template ReportSchedule
+  with
+    dao : Party
+    bank : Party
+    poolId : Text
+    regulators : Set Party
+    reportingFrequencyDays : Int  -- 30 for monthly, 90 for quarterly
+    lastReportDate : Optional Time
+    nextReportDue : Time
+  where
+    signatory dao, bank
+    observer regulators
+    
+    key (dao, bank, poolId) : (Party, Party, Text)
+    maintainer key._2
+    
+    -- | Bank (or anyone) triggers report generation if due
+    choice GenerateReport : (ContractId ReportSchedule, ContractId RegulatoryReport)
+      with
+        -- Metrics provided by bank (aggregated from loans)
+        metrics : ReportMetrics
+      controller bank
+      do
+        now <- getTime
+        
+        -- Check if report is due
+        assertMsg "Report not yet due" $ now >= nextReportDue
+        
+        -- Generate report period string
+        let reportPeriod = formatReportPeriod now
+        
+        -- Create the regulatory report
+        reportCid <- create RegulatoryReport
+          with
+            dao
+            bank
+            regulators
+            poolId
+            reportPeriod
+            reportGeneratedAt = now
+            
+            -- Loan metrics
+            totalActiveLoans = metrics.totalActiveLoans
+            totalLoanVolume = metrics.totalLoanVolume
+            totalDefaultedLoans = metrics.totalDefaultedLoans
+            totalDefaultedVolume = metrics.totalDefaultedVolume
+            averageLoanSize = if metrics.totalActiveLoans > 0
+                                then metrics.totalLoanVolume / intToDecimal metrics.totalActiveLoans
+                                else 0.0
+            averageInterestRate = metrics.averageInterestRate
+            
+            -- Compliance metrics
+            kycComplianceRate = calculateKycCompliance metrics
+            totalKycVerified = metrics.totalKycVerified
+            totalKycPending = metrics.totalKycPending
+            totalKycRejected = metrics.totalKycRejected
+            
+            -- Risk metrics
+            averageCreditScore = metrics.averageCreditScore
+            averageCollateralRatio = metrics.averageCollateralRatio
+            loansAtRisk = metrics.loansAtRisk
+            
+            -- Financial metrics
+            totalInterestCollected = metrics.totalInterestCollected
+            totalPrincipalRepaid = metrics.totalPrincipalRepaid
+            daoFeesCollected = metrics.daoFeesCollected
+            outstandingPrincipal = metrics.outstandingPrincipal
+            
+            -- Investor metrics
+            totalInvestors = metrics.totalInvestors
+            totalInvestedCapital = metrics.totalInvestedCapital
+            
+            reportStatus = Pending
+            acknowledgedBy = None
+            regulatorNotes = None
+        
+        -- Update schedule for next period
+        let nextDueDate = addDays now reportingFrequencyDays
+        newScheduleCid <- create this with
+          lastReportDate = Some now
+          nextReportDue = nextDueDate
+        
+        return (newScheduleCid, reportCid)
+    
+    -- | Update reporting frequency
+    choice UpdateReportingFrequency : ContractId ReportSchedule
+      with
+        newFrequencyDays : Int
+      controller bank
+      do
+        now <- getTime
+        let newDueDate = addDays now newFrequencyDays
+        
+        create this with
+          reportingFrequencyDays = newFrequencyDays
+          nextReportDue = newDueDate
+
+-- | Metrics data structure for report generation
+data ReportMetrics = ReportMetrics
+  with
+    -- Loan metrics
+    totalActiveLoans : Int
+    totalLoanVolume : Decimal
+    totalDefaultedLoans : Int
+    totalDefaultedVolume : Decimal
+    averageInterestRate : Decimal
+    
+    -- KYC metrics
+    totalKycVerified : Int
+    totalKycPending : Int
+    totalKycRejected : Int
+    
+    -- Risk metrics
+    averageCreditScore : Optional Decimal
+    averageCollateralRatio : Decimal
+    loansAtRisk : Int
+    
+    -- Financial metrics
+    totalInterestCollected : Decimal
+    totalPrincipalRepaid : Decimal
+    daoFeesCollected : Decimal
+    outstandingPrincipal : Decimal
+    
+    -- Investor metrics
+    totalInvestors : Int
+    totalInvestedCapital : Decimal
+  deriving (Eq, Show)
+
+-- ============================================================================
+-- LOAN-LEVEL REPORTING (for detailed audit)
+-- ============================================================================
+
+-- | Individual loan report entry
+-- Links specific loan details to regulatory oversight
+template LoanReportEntry
+  with
+    dao : Party
+    bank : Party
+    regulator : Party
+    poolId : Text
+    loanId : Text
+    borrowerKycHash : Text        -- Hash of borrower identity (privacy-preserving)
+    loanAmount : Decimal
+    interestRate : Decimal
+    collateralValue : Decimal
+    collateralType : Text
+    loanStatus : LoanStatus
+    kycVerified : Bool
+    creditScore : Optional Int
+    issuedAt : Time
+    lastPaymentAt : Optional Time
+  where
+    signatory bank
+    observer regulator
+    
+    key (dao, bank, regulator, loanId) : (Party, Party, Party, Text)
+    maintainer key._2
+
+-- ============================================================================
+-- HELPER FUNCTIONS
+-- ============================================================================
+
+-- | Calculate KYC compliance rate
+calculateKycCompliance : ReportMetrics -> Decimal
+calculateKycCompliance metrics =
+  let total = metrics.totalKycVerified + metrics.totalKycPending + metrics.totalKycRejected
+  in if total > 0
+       then (intToDecimal metrics.totalKycVerified / intToDecimal total) * 100.0
+       else 100.0  -- No loans = 100% compliant
+
+-- | Format report period (simplified)
+formatReportPeriod : Time -> Text
+formatReportPeriod t =
+  -- In production, would properly format as "2025-01"
+  -- For MVP, use timestamp as unique identifier
+  show t
+
+-- | Add days to a time (helper for next report date)
+addDays : Time -> Int -> Time
+addDays t numDays =
+  T.addRelTime t (T.days numDays)
+
+-- | Create initial report schedule for a pool
+createReportSchedule : Party -> Party -> Text -> Set Party -> Int -> Update (ContractId ReportSchedule)
+createReportSchedule dao bank poolId regulators frequencyDays = do
+  now <- getTime
+  let nextDue = addDays now frequencyDays
+  
+  create ReportSchedule
+    with
+      dao
+      bank
+      poolId
+      regulators
+      reportingFrequencyDays = frequencyDays
+      lastReportDate = None
+      nextReportDue = nextDue
+
+-- | Create empty metrics (for testing)
+emptyMetrics : ReportMetrics
+emptyMetrics = ReportMetrics
+  with
+    totalActiveLoans = 0
+    totalLoanVolume = 0.0
+    totalDefaultedLoans = 0
+    totalDefaultedVolume = 0.0
+    averageInterestRate = 0.0
+    totalKycVerified = 0
+    totalKycPending = 0
+    totalKycRejected = 0
+    averageCreditScore = None
+    averageCollateralRatio = 0.0
+    loansAtRisk = 0
+    totalInterestCollected = 0.0
+    totalPrincipalRepaid = 0.0
+    daoFeesCollected = 0.0
+    outstandingPrincipal = 0.0
+    totalInvestors = 0
+    totalInvestedCapital = 0.0

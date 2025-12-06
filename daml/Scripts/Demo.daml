@@ -1,0 +1,549 @@
+-- Comprehensive Demo Script for Decentralized Lending Protocol
+-- Shows complete end-to-end flow from protocol creation to loan repayment
+-- Daml 2.10.2 Compatible
+-- Canton Network Hackathon Project
+
+module Scripts.Demo where
+
+import Daml.Script
+import qualified DA.Set as Set
+import qualified DA.Map as Map
+
+import LendingProtocol.Root
+import LendingProtocol.Types
+import LendingProtocol.Bank.LendingPool
+import LendingProtocol.Bank.Pools
+import LendingProtocol.Borrower.Loan
+import LendingProtocol.Oracle
+import LendingProtocol.Regulator
+
+-- ============================================================================
+-- COMPREHENSIVE DEMO: PROTOCOL SETUP TO LOAN REPAYMENT
+-- ============================================================================
+
+demo : Script ()
+demo = script do
+  debug "============================================="
+  debug "ðŸš€ CANTON LENDING PROTOCOL DEMO"
+  debug "============================================="
+  debug ""
+  
+  -- ===========================================================================
+  -- PHASE 1: PROTOCOL INITIALIZATION
+  -- ===========================================================================
+  debug "ðŸ“‹ PHASE 1: Protocol Initialization"
+  debug "-------------------------------------------"
+  
+  -- Allocate all parties
+  dao <- allocateParty "DAO"
+  debug "âœ“ DAO created"
+  
+  bank <- allocateParty "GlobalBank"
+  debug "âœ“ GlobalBank created"
+  
+  regulator <- allocateParty "FinancialRegulator"
+  debug "âœ“ Financial Regulator created"
+  
+  investor1 <- allocateParty "Alice_Investor"
+  investor2 <- allocateParty "Bob_Investor"
+  debug "âœ“ Investors created (Alice, Bob)"
+  
+  borrower <- allocateParty "Carol_Borrower"
+  debug "âœ“ Borrower created (Carol)"
+  
+  -- Oracle parties
+  kycOracle <- allocateParty "KYC_Oracle"
+  creditOracle <- allocateParty "CreditBureau"
+  debug "âœ“ Oracle services created"
+  
+  debug ""
+  
+  -- DAO creates the protocol
+  debug " DAO initializing protocol with 0.5% fee..."
+  protocolRootCid <- submit dao do
+    createCmd ProtocolRoot
+      with
+        dao
+        config = ProtocolConfig with
+          daoFeePercentage = 0.5
+          reportingPeriodDays = 30
+        invitedBanks = Map.empty
+        protocolVersion = "1.0.0-DEMO"
+  debug "âœ“ Protocol created successfully"
+  debug ""
+  
+  -- ===========================================================================
+  -- PHASE 2: BANK ONBOARDING
+  -- ===========================================================================
+  debug "ðŸ“‹ PHASE 2: Bank Onboarding"
+  debug "-------------------------------------------"
+  
+  -- DAO invites bank
+  debug "ðŸ“¨ DAO inviting GlobalBank to the protocol..."
+  invitationCid <- submit dao do
+    exerciseCmd protocolRootCid InviteBank
+      with
+        bankId = bank
+        bankName = "Global Banking Corporation"
+  debug "âœ“ Invitation sent"
+  
+  -- Bank accepts invitation
+  debug "âœ… GlobalBank accepting invitation..."
+  bankSubtreeCid <- submit bank do
+    exerciseCmd invitationCid AcceptInvitation
+  debug "âœ“ GlobalBank joined the protocol"
+  
+  -- Bank invites regulator
+  debug "ðŸ‘” GlobalBank inviting Financial Regulator..."
+  bankSubtreeCid <- submit bank do
+    exerciseCmd bankSubtreeCid InviteRegulator with regulator
+  debug "âœ“ Regulator invited"
+  debug ""
+  
+  -- ===========================================================================
+  -- PHASE 3: ORACLE SETUP
+  -- ===========================================================================
+  debug "ðŸ“‹ PHASE 3: Oracle Services Setup"
+  debug "-------------------------------------------"
+  
+  debug "Setting up KYC Oracle..."
+  kycOracleCid <- submit kycOracle do
+    createCmd KycOracle
+      with
+        oracle = kycOracle
+        supportedBanks = Set.singleton bank
+        serviceName = "Global KYC Verification Service"
+  debug "âœ“ KYC Oracle ready"
+  
+  debug "ðŸ“Š Setting up Credit Bureau Oracle..."
+  creditOracleCid <- submit creditOracle do
+    createCmd CreditScoreOracle
+      with
+        oracle = creditOracle
+        supportedBanks = Set.singleton bank
+        bureauName = "International Credit Bureau"
+  debug "âœ“ Credit Bureau ready"
+  debug ""
+  
+  -- ===========================================================================
+  -- PHASE 4: LENDING POOL CREATION
+  -- ===========================================================================
+  debug "ðŸ“‹ PHASE 4: Lending Pool Creation"
+  debug "-------------------------------------------"
+  
+  -- Define pool rules
+  now <- getTime
+  debug "ðŸ“œ Defining pool rules..."
+  
+  let kycRule = Rule with
+        ruleId = "kyc-required"
+        category = ParticipationRules
+        ruleType = RequireKyc
+        enabled = True
+        description = "KYC verification required for all participants"
+        createdAt = now
+        updatedAt = now
+  
+  let minCreditScore = Rule with
+        ruleId = "min-credit-score"
+        category = BorrowingRules
+        ruleType = MinimumCreditScoreForRole with role = Borrower; minScore = 650
+        enabled = True
+        description = "Borrowers must have credit score of 650+"
+        createdAt = now
+        updatedAt = now
+  
+  let minCollateral = Rule with
+        ruleId = "min-collateral"
+        category = BorrowingRules
+        ruleType = MinimumCollateralRatio with ratio = 1.2
+        enabled = True
+        description = "Loans must be backed by 120% collateral"
+        createdAt = now
+        updatedAt = now
+  
+  let minInvestment = Rule with
+        ruleId = "min-investment"
+        category = InvestmentRules
+        ruleType = MinimumInvestmentAmount with amount = 10000.0
+        enabled = True
+        description = "Minimum investment is $10,000"
+        createdAt = now
+        updatedAt = now
+  
+  debug "âœ“ Rules defined (KYC, Credit Score, Collateral, Investment minimums)"
+  
+  -- Bank proposes lending pool
+  debug "GlobalBank proposing 'Conservative Lending Pool'..."
+  proposalCid <- submit bank do
+    createCmd LendingPoolProposal
+      with
+        dao
+        bank
+        poolId = "conservative-pool-1"
+        poolName = "Conservative Lending Pool"
+        poolDescription = "Low-risk lending pool with strict requirements"
+        maxTotalCapitalization = 5000000.0  -- $5M cap
+        initialRules = [kycRule, minCreditScore, minCollateral, minInvestment]
+        regulators = Set.singleton regulator
+        proposedAt = now
+  debug "âœ“ Pool proposal submitted"
+  
+  -- DAO approves pool
+  debug "âœ… DAO reviewing and approving pool..."
+  (lendingPoolCid, ruleSetCid) <- submit dao do
+    exerciseCmd proposalCid ApprovePoolCreation
+  debug "âœ“ Pool approved and created"
+  debug ""
+  
+  -- ===========================================================================
+  -- PHASE 5: INVESTMENT POOL SETUP
+  -- ===========================================================================
+  debug "ðŸ“‹ PHASE 5: Investment Pool Setup"
+  debug "-------------------------------------------"
+  
+  debug "ðŸ’° Creating investment pool for Conservative Lending Pool..."
+  investmentPoolCid <- submitMulti [dao, bank] [] do
+    createCmd InvestmentPool
+      with
+        dao
+        bank
+        poolId = "conservative-pool-1"
+        lendingPoolCid
+        ruleSetCid
+        totalInvested = 0.0
+        activeInvestors = Set.empty
+        assetType = "USDT"
+  debug "âœ“ Investment pool created"
+  debug ""
+  
+  -- ===========================================================================
+  -- PHASE 6: INVESTOR INVESTMENTS
+  -- ===========================================================================
+  debug "ðŸ“‹ PHASE 6: Investor Capital Contributions"
+  debug "-------------------------------------------"
+  
+  -- Alice invests
+  debug "ðŸ’µ Alice investing $100,000..."
+  (investmentPoolCid, alicePositionCid, aliceReturnsCid) <- submitMulti [investor1, bank] [] do
+    exerciseCmd investmentPoolCid Invest
+      with
+        investor = investor1
+        amount = 100000.0
+  debug "âœ“ Alice's investment recorded"
+  debug "  â””â”€ Position created"
+  debug "  â””â”€ Private returns tracker created (only Alice can see)"
+  
+  -- Bob invests
+  debug "ðŸ’µ Bob investing $150,000..."
+  (investmentPoolCid, bobPositionCid, bobReturnsCid) <- submitMulti [investor2, bank] [] do
+    exerciseCmd investmentPoolCid Invest
+      with
+        investor = investor2
+        amount = 150000.0
+  debug "âœ“ Bob's investment recorded"
+  debug "  â””â”€ Total pool capital: $250,000"
+  debug ""
+  -- Extract the updated lending pool CID from the investment pool
+  Some updatedInvestmentPool <- queryContractId bank investmentPoolCid
+  let lendingPoolCid = updatedInvestmentPool.lendingPoolCid
+
+  
+  -- ===========================================================================
+  -- PHASE 7: BORROWER APPLICATION
+  -- ===========================================================================
+  debug "ðŸ“‹ PHASE 7: Loan Application Process"
+  debug "-------------------------------------------"
+  
+  -- Carol submits loan application
+  debug "Carol applying for $50,000 loan..."
+  debug ("DEBUG: borrower = " <> show borrower)
+  debug ("DEBUG: bank = " <> show bank)
+  now2 <- getTime
+  applicationCid <- submitMulti [borrower, bank] [] do
+    createCmd LoanApplication
+      with
+        dao
+        bank
+        poolId = "conservative-pool-1"
+        borrower
+        requestedAmount = 50000.0
+        proposedCollateralValue = 65000.0  -- 130% collateral ratio
+        proposedTermDays = 365  -- 1 year
+        proposedInterestRate = 0.08  -- 8% APR
+        assetType = "USDT"
+        collateralAssetType = "BTC"
+        kycStatus = KycPending
+        kycResultCid = None
+        creditScore = None
+        creditScoreResultCid = None
+        assetValuationCid = None
+        appliedAt = now2
+  debug "âœ“ Application submitted"
+  debug "  â””â”€ Loan amount: $50,000"
+  debug "  â””â”€ Collateral: $65,000 in BTC (130% ratio)"
+  debug "  â””â”€ Term: 1 year @ 8% APR"
+  debug ""
+  
+  -- ===========================================================================
+  -- PHASE 8: KYC VERIFICATION
+  -- ===========================================================================
+  debug "ðŸ“‹ PHASE 8: KYC Verification Process"
+  debug "-------------------------------------------"
+  
+  -- Bank requests KYC
+  debug "GlobalBank requesting KYC verification..."
+  kycRequestCid <- submit bank do
+    exerciseCmd applicationCid RequestKycFromOracle
+      with
+        kycOracleCid
+        requestId = "kyc-carol-001"
+  debug "âœ“ KYC request sent to oracle"
+  
+  -- Oracle provides KYC result
+  debug "âœ… KYC Oracle verifying Carol's identity..."
+  kycResultCid <- submitMulti [kycOracle, bank] [] do
+    exerciseCmd kycRequestCid ProvideKycResult
+      with
+        result = KycVerificationResult with
+          verified = True
+          riskScore = 15  -- Low risk
+          verificationType = "passport"
+          verificationDate = now2
+          expiryDate = None
+  debug "âœ“ KYC verification successful"
+  debug "  â””â”€ Risk score: 15 (low)"
+  debug "  â””â”€ Verification: Passport"
+  
+  -- Bank receives KYC and creates private data
+  debug "ðŸ”’ GlobalBank creating private KYC data..."
+  (newApplicationCid, privateKycCid) <- submitMulti [bank, borrower] [] do
+    exerciseCmd applicationCid ReceiveKycResult
+      with
+        kycResultCid
+        regulator
+        fullName = "Carol Thompson"
+        nationalId = "US-987-654-3210"
+        address = "456 Oak Avenue, New York, NY 10001"
+        phone = "+1-555-0123"
+        email = "carol.thompson@email.com"
+  debug "âœ“ Private KYC data created"
+  debug "  â””â”€ Visible only to: GlobalBank, Carol, Regulator"
+  debug "  â””â”€ Hidden from: All investors"
+  debug ""
+  
+  -- ===========================================================================
+  -- PHASE 9: CREDIT SCORE VERIFICATION
+  -- ===========================================================================
+  debug "ðŸ“‹ PHASE 9: Credit Score Verification"
+  debug "-------------------------------------------"
+  
+  -- Bank requests credit score
+  debug "ðŸ“Š GlobalBank requesting credit score..."
+  creditRequestCid <- submit bank do
+    exerciseCmd newApplicationCid RequestCreditScoreFromOracle
+      with
+        creditOracleCid
+        requestId = "credit-carol-001"
+  debug "âœ“ Credit score request sent"
+  
+  -- Oracle provides credit score
+  debug "âœ… Credit Bureau providing score..."
+  creditResultCid <- submitMulti [creditOracle, bank, borrower] [] do
+    exerciseCmd creditRequestCid ProvideCreditScore
+      with
+        scoreData = CreditScoreData with
+          score = 720
+          scoreModel = "FICO"
+          riskCategory = "good"
+          reportDate = now2
+  debug "âœ“ Credit score received: 720 (Good)"
+  
+  -- Bank receives credit score
+  newApplicationCid <- submitMulti [dao, bank, borrower] [] do
+    exerciseCmd newApplicationCid ReceiveCreditScoreResult
+      with creditResultCid
+  debug "âœ“ Credit score added to application"
+  debug ""
+  
+  -- ===========================================================================
+  -- PHASE 10: LOAN APPROVAL
+  -- ===========================================================================
+  debug "ðŸ“‹ PHASE 10: Loan Approval & Funding"
+  debug "-------------------------------------------"
+  
+  debug "GlobalBank reviewing application..."
+  debug "  âœ“ KYC verified"
+  debug "  âœ“ Credit score 720 (meets 650+ requirement)"
+  debug "  âœ“ Collateral ratio 130% (exceeds 120% requirement)"
+  debug "  âœ“ Pool has available capital"
+  debug ""
+  
+  debug "âœ… GlobalBank approving and funding loan..."
+  (loanCid, collateralCid, trackerCid, privateLoanCid, publicSummaryCid) <-
+    submitMulti [bank, borrower] [] do
+      exerciseCmd newApplicationCid ApproveLoan
+        with
+          lendingPoolCid
+          investmentPoolCid
+          ruleSetCid
+          approvedAmount = 50000.0
+          approvedTermDays = 365
+          approvedInterestRate = 0.08
+          regulator
+          investors = Set.fromList [investor1, investor2]
+  
+  debug "âœ“ Loan approved and funded!"
+  debug "  âœ“ Collateral locked ($65,000 BTC)"
+  debug "  âœ“ Private loan agreement created (Bank, Carol, Regulator)"
+  debug "  âœ“ Public summary created (Alice & Bob can see bucketed data)"
+  debug "  â””â”€ Investors see: '$50-100K' loan, '7-10%' rate, 'BTC' collateral"
+  debug "  â””â”€ Investors DON'T see: Borrower identity, exact amounts"
+  debug ""
+  
+  -- ===========================================================================
+  -- PHASE 11: LOAN REPAYMENT
+  -- ===========================================================================
+  debug "ðŸ“‹ PHASE 11: Loan Repayment Process"
+  debug "-------------------------------------------"
+  
+  debug "ðŸ’³ Carol making first monthly payment..."
+  debug "  â””â”€ Payment amount: $4,500"
+  debug "  â””â”€ Interest portion: $333.33"
+  debug "  â””â”€ Principal portion: $4,166.67"
+  
+  (loanCid, trackerCid) <- submit borrower do
+    exerciseCmd loanCid MakePayment
+      with
+        paymentAmount = 4500.0
+        interestPortion = 333.33
+        principalPortion = 4166.67
+  
+  debug "âœ“ Payment processed"
+  debug "  â””â”€ Interest distributed to pool: $333.33"
+  debug "  â””â”€ DAO fee collected: $1.67 (0.5% of interest)"
+  debug "  â””â”€ Principal repaid: $4,166.67"
+  debug "  â””â”€ Remaining principal: $45,833.33"
+  debug ""
+  
+  -- Make a few more payments
+  debug "ðŸ’³ Carol making second monthly payment..."
+  (loanCid, trackerCid) <- submit borrower do
+    exerciseCmd loanCid MakePayment
+      with
+        paymentAmount = 4500.0
+        interestPortion = 305.56
+        principalPortion = 4194.44
+  debug "âœ“ Payment 2 processed"
+  
+  debug "ðŸ’³ Carol making third monthly payment..."
+  (loanCid, trackerCid) <- submit borrower do
+    exerciseCmd loanCid MakePayment
+      with
+        paymentAmount = 4500.0
+        interestPortion = 277.52
+        principalPortion = 4222.48
+  debug "âœ“ Payment 3 processed"
+  debug "  â””â”€ Total payments made: 3"
+  debug "  â””â”€ Total paid: $13,500"
+  debug "  â””â”€ Remaining principal: ~$37,416"
+  debug ""
+  
+  -- ===========================================================================
+  -- PHASE 12: REGULATORY REPORTING
+  -- ===========================================================================
+  debug "ðŸ“‹ PHASE 12: Regulatory Reporting"
+  debug "-------------------------------------------"
+  
+  debug "ðŸ“Š Generating monthly regulatory report..."
+  
+  let reportMetrics = ReportMetrics with
+        totalActiveLoans = 1
+        totalLoanVolume = 50000.0
+        totalDefaultedLoans = 0
+        totalDefaultedVolume = 0.0
+        averageInterestRate = 0.08
+        totalKycVerified = 1
+        totalKycPending = 0
+        totalKycRejected = 0
+        averageCreditScore = Some 720.0
+        averageCollateralRatio = 1.30
+        loansAtRisk = 0
+        totalInterestCollected = 916.41
+        totalPrincipalRepaid = 12583.59
+        daoFeesCollected = 4.58
+        outstandingPrincipal = 37416.41
+        totalInvestors = 2
+        totalInvestedCapital = 250000.0
+  
+  -- Create report schedule first
+  reportScheduleCid <- submitMulti [dao, bank] [] do
+    createCmd ReportSchedule
+      with
+        dao
+        bank
+        poolId = "conservative-pool-1"
+        regulators = Set.singleton regulator
+        reportingFrequencyDays = 30
+        lastReportDate = None
+        nextReportDue = now2
+  
+  -- Generate report
+  (newScheduleCid, reportCid) <- submit bank do
+    exerciseCmd reportScheduleCid GenerateReport with metrics = reportMetrics
+  
+  debug "âœ“ Report generated and submitted to regulator"
+  debug "  â””â”€ Active loans: 1"
+  debug "  â””â”€ Total loan volume: $50,000"
+  debug "  â””â”€ KYC compliance: 100%"
+  debug "  â””â”€ Average credit score: 720"
+  debug "  â””â”€ Interest collected: $916.41"
+  debug "  â””â”€ DAO fees: $4.58"
+  debug ""
+  
+  -- Regulator acknowledges report
+  debug "ðŸ‘” Financial Regulator reviewing report..."
+  acknowledgedReportCid <- submit regulator do
+    exerciseCmd reportCid AcknowledgeReport
+      with
+        regulator
+        notes = Some "Report reviewed. All compliance requirements met. Pool operating within regulatory guidelines."
+  debug "âœ“ Report acknowledged by regulator"
+  debug ""
+  
+  -- ===========================================================================
+  -- DEMO COMPLETE
+  -- ===========================================================================
+  debug "============================================="
+  debug "âœ… DEMO COMPLETE!"
+  debug "============================================="
+  debug ""
+  debug "ðŸŽ¯ Key Features Demonstrated:"
+  debug "  âœ“ Multi-party protocol (DAO, Bank, Investors, Borrower, Regulator, Oracles)"
+  debug "  âœ“ Privacy-preserving KYC (hidden from investors)"
+  debug "  âœ“ Privacy-preserving loan details (bucketed public data)"
+  debug "  âœ“ Rule-based lending (credit score, collateral, KYC requirements)"
+  debug "  âœ“ Oracle integration (KYC, Credit Bureau)"
+  debug "  âœ“ Regulatory reporting & oversight"
+  debug "  âœ“ DAO fee collection (0.5% of interest)"
+  debug "  âœ“ Multi-investor capital pooling"
+  debug "  âœ“ Collateral management"
+  debug "  âœ“ Loan repayment tracking"
+  debug ""
+  debug " Canton Network Features Used:"
+  debug "  âœ“ Sub-transaction privacy (Private KYC, Private returns)"
+  debug "  âœ“ Multi-party workflows"
+  debug "  âœ“ Fine-grained access control"
+  debug "  âœ“ Composable contracts"
+  debug "  âœ“ Atomic multi-party transactions"
+  debug ""
+  debug "ðŸ’¡ Next Steps:"
+  debug "  â€¢ Test loan liquidation scenarios"
+  debug "  â€¢ Test investor withdrawal mechanisms"
+  debug "  â€¢ Add more complex rule sets"
+  debug "  â€¢ Integrate real oracle feeds"
+  debug "  â€¢ Deploy to Canton Network testnet"
+  debug ""
+  debug "============================================="
+  
+  return ()

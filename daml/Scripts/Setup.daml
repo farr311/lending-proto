@@ -1,0 +1,48 @@
+module Scripts.Setup where
+
+import Daml.Script
+import LendingProtocol.Root
+import qualified DA.Map as Map
+
+-- | Initialize the protocol with a DAO
+setup : Script ()
+setup = script do
+  -- Allocate parties
+  dao <- allocateParty "DAO"
+  bank1 <- allocateParty "Bank1"
+  bank2 <- allocateParty "Bank2"
+  
+  -- Create the initial protocol root with 0.5% DAO fee
+  protocolRootCid <- submit dao do
+    createCmd ProtocolRoot
+      with
+        dao
+        config = ProtocolConfig
+          with
+            daoFeePercentage = 0.5
+            reportingPeriodDays = 30
+        invitedBanks = Map.empty
+        protocolVersion = "1.0.0-MVP"
+  
+  -- DAO invites Bank1
+  invitation1Cid <- submit dao do
+    exerciseCmd protocolRootCid InviteBank
+      with
+        bankId = bank1
+        bankName = "First National Bank"
+  
+  -- Bank1 accepts the invitation
+  bankSubtree1Cid <- submit bank1 do
+    exerciseCmd invitation1Cid AcceptInvitation
+  
+  -- DAO invites Bank2
+  invitation2Cid <- submit dao do
+    exerciseCmd protocolRootCid InviteBank
+      with
+        bankId = bank2
+        bankName = "Second Federal Bank"
+  
+  debug "Protocol initialized successfully!"
+  debug ("Bank1 subtree created: " <> show bankSubtree1Cid)
+  
+  return ()

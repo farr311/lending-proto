@@ -1,0 +1,250 @@
+-- Lending Pool Contract for Bank Operations
+-- Daml 2.10.2 Compatible
+-- Canton Network Hackathon Project
+
+module LendingProtocol.Bank.LendingPool where
+
+import DA.Set (Set)
+import LendingProtocol.Types
+import LendingProtocol.Bank.Rules
+
+-- | Helper function to create a pool proposal from BankSubtree
+-- Bank calls this to propose a new pool
+createPoolProposal : Party -> Party -> Text -> Text -> Text -> Decimal -> Set Party -> [Rule] -> Time -> Update (ContractId LendingPoolProposal)
+createPoolProposal dao bank poolId poolName poolDescription maxCap regulators initialRules proposedAt = do
+  create LendingPoolProposal
+    with
+      dao
+      bank
+      poolId
+      poolName
+      poolDescription
+      maxTotalCapitalization = maxCap
+      regulators
+      initialRules
+      proposedAt
+
+-- | Individual lending pool - isolated lending operation
+-- Each pool has its own rules, caps, and loan portfolio
+template LendingPool
+  with
+    dao : Party
+    bank : Party
+    poolId : Text                        -- Unique identifier (e.g., "citi-conservative")
+    poolName : Text                      -- Display name
+    poolDescription : Text               -- Description for investors/borrowers
+    maxTotalCapitalization : Decimal     -- Maximum total capital (mandatory)
+    currentCapitalization : Decimal      -- Current total invested capital
+    totalLoansIssued : Decimal           -- Total value of active loans
+    poolStatus : PoolStatus              -- Active, Closing, or Closed
+    regulators : Set Party               -- Inherited from BankSubtree
+    ruleSetCid : ContractId LendingPoolRuleSet  -- Pool-specific rules
+    reportScheduleCid : Optional Text    -- Store as text reference for now (avoid circular dep)
+    createdAt : Time
+  where
+    signatory dao, bank
+    observer regulators
+    
+    key (dao, bank, poolId) : (Party, Party, Text)
+    maintainer key._2
+    
+    -- Ensure pool doesn't exceed cap and loans don't exceed capital
+    ensure currentCapitalization <= maxTotalCapitalization && 
+           totalLoansIssued <= currentCapitalization
+    
+    -- | Bank updates pool settings
+    choice UpdatePoolSettings : ContractId LendingPool
+      with
+        newMaxCap : Decimal
+        newDescription : Text
+      controller bank
+      do
+        assertMsg "Pool is closed" $ poolStatus /= Closed
+        assertMsg "New cap must be >= current capitalization" $ 
+          newMaxCap >= currentCapitalization
+        
+        create this with
+          maxTotalCapitalization = newMaxCap
+          poolDescription = newDescription
+    
+    -- | Bank initiates pool closure (wind-down phase)
+    choice InitiatePoolClosure : ContractId LendingPool
+      controller bank
+      do
+        assertMsg "Pool already closing or closed" $ poolStatus == Open
+        
+        create this with
+          poolStatus = Closing
+    
+    -- | Bank finalizes pool closure (after all loans repaid)
+    choice FinalizePoolClosure : ()
+      controller bank
+      do
+        assertMsg "Pool must be in Closing state" $ poolStatus == Closing
+        assertMsg "Cannot close pool with active loans" $ totalLoansIssued == 0.0
+        
+        -- Pool will be archived, investors should have withdrawn by now
+        return ()
+    
+    -- | Bank reactivates a closing pool (emergency measure)
+    choice ReactivatePool : ContractId LendingPool
+      controller bank
+      do
+        assertMsg "Pool is not in Closing state" $ poolStatus == Closing
+        
+        create this with
+          poolStatus = Open
+    
+    -- | Non-consuming choice to check if pool can accept more capital
+    nonconsuming choice CanAcceptInvestment : Bool
+      with
+        amount : Decimal
+      controller bank
+      do
+        if poolStatus /= Open
+          then return False
+          else return $ (currentCapitalization + amount) <= maxTotalCapitalization
+    
+    -- | Non-consuming choice to check if pool can issue a loan
+    nonconsuming choice CanIssueLoan : Bool
+      with
+        loanAmount : Decimal
+      controller bank
+      do
+        if poolStatus /= Open
+          then return False
+          else do
+            -- Check if we have enough uninvested capital
+            let availableCapital = currentCapitalization - totalLoansIssued
+            return $ loanAmount <= availableCapital
+    
+    -- | Record investment (called by InvestmentPool contract)
+    choice RecordInvestment : ContractId LendingPool
+      with
+        amount : Decimal
+      controller bank
+      do
+        assertMsg "Pool not active" $ poolStatus == Open
+        assertMsg "Investment exceeds pool cap" $ 
+          (currentCapitalization + amount) <= maxTotalCapitalization
+        
+        create this with
+          currentCapitalization = currentCapitalization + amount
+    
+    -- | Record loan issuance (called by Loan contract)
+    choice RecordLoanIssuance : ContractId LendingPool
+      with
+        loanAmount : Decimal
+      controller bank
+      do
+        assertMsg "Pool not active" $ poolStatus == Open
+        let availableCapital = currentCapitalization - totalLoansIssued
+        assertMsg "Insufficient capital for loan" $ loanAmount <= availableCapital
+        
+        create this with
+          totalLoansIssued = totalLoansIssued + loanAmount
+    
+    -- | Record loan repayment (called by Loan contract)
+    choice RecordLoanRepayment : ContractId LendingPool
+      with
+        repaymentAmount : Decimal
+      controller bank
+      do
+        assertMsg "Repayment exceeds total loans" $ repaymentAmount <= totalLoansIssued
+        
+        create this with
+          totalLoansIssued = totalLoansIssued - repaymentAmount
+    
+    -- | Record investment withdrawal (called by InvestmentPool contract)
+    choice RecordWithdrawal : ContractId LendingPool
+      with
+        amount : Decimal
+      controller bank
+      do
+        assertMsg "Withdrawal exceeds capitalization" $ amount <= currentCapitalization
+        let availableCapital = currentCapitalization - totalLoansIssued
+        assertMsg "Insufficient liquid capital for withdrawal" $ amount <= availableCapital
+        
+        create this with
+          currentCapitalization = currentCapitalization - amount
+    
+    -- | Non-consuming choice to get pool statistics
+    nonconsuming choice GetPoolStats : PoolStats
+      controller bank
+      do
+        return PoolStats with
+          totalCapital = currentCapitalization
+          totalLoansOutstanding = totalLoansIssued
+          availableCapital = currentCapitalization - totalLoansIssued
+          utilizationRate = if currentCapitalization > 0.0
+                              then totalLoansIssued / currentCapitalization
+                              else 0.0
+          status = poolStatus
+
+-- | Pool statistics for reporting
+data PoolStats = PoolStats
+  with
+    totalCapital : Decimal
+    totalLoansOutstanding : Decimal
+    availableCapital : Decimal
+    utilizationRate : Decimal         -- Percentage of capital deployed as loans
+    status : PoolStatus
+  deriving (Eq, Show)
+
+-- | Proposal for creating a new lending pool
+-- Bank proposes, then DAO approves to create the actual pool
+template LendingPoolProposal
+  with
+    dao : Party
+    bank : Party
+    poolId : Text
+    poolName : Text
+    poolDescription : Text
+    maxTotalCapitalization : Decimal
+    regulators : Set Party
+    initialRules : [Rule]
+    proposedAt : Time
+  where
+    signatory bank
+    observer dao
+    
+    -- | DAO approves the pool creation
+    choice ApprovePoolCreation : (ContractId LendingPool, ContractId LendingPoolRuleSet)
+      controller dao
+      do
+        -- Create the ruleset first
+        ruleSetCid <- createRuleSetWithRules dao bank poolId initialRules
+        
+        -- Create the lending pool
+        poolCid <- create LendingPool
+          with
+            dao
+            bank
+            poolId
+            poolName
+            poolDescription
+            maxTotalCapitalization
+            currentCapitalization = 0.0
+            totalLoansIssued = 0.0
+            poolStatus = Open
+            regulators
+            ruleSetCid
+            reportScheduleCid = None  -- Will be created after pool approval
+            createdAt = proposedAt
+        
+        return (poolCid, ruleSetCid)
+    
+    -- | DAO rejects the pool proposal
+    choice RejectPoolCreation : ()
+      with
+        reason : Text
+      controller dao
+      do
+        -- Just archive the proposal
+        return ()
+    
+    -- | Bank withdraws their proposal
+    choice WithdrawProposal : ()
+      controller bank
+      do
+        return ()

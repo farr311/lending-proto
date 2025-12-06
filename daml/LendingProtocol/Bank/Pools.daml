@@ -1,0 +1,247 @@
+-- Asset Pool Contracts - Investment Pool Only
+-- Collateral and Repayment are loan-specific (see Loan.daml)
+-- Daml 2.10.2 Compatible
+-- Canton Network Hackathon Project
+
+module LendingProtocol.Bank.Pools where
+
+import qualified DA.Map as Map
+import DA.Set (Set)
+import qualified DA.Set as Set
+import DA.Optional (fromOptional)
+import LendingProtocol.Types
+import LendingProtocol.Bank.Rules
+import LendingProtocol.Bank.LendingPool
+import LendingProtocol.Privacy
+
+-- ============================================================================
+-- INVESTMENT POOL - Where investors contribute capital
+-- ============================================================================
+
+-- | Investment pool for a specific lending pool
+-- Aggregates all investor capital
+template InvestmentPool
+  with
+    dao : Party
+    bank : Party
+    poolId : Text                       -- Links to LendingPool
+    lendingPoolCid : ContractId LendingPool
+    ruleSetCid : ContractId LendingPoolRuleSet
+    totalInvested : Decimal             -- Total capital in pool
+    activeInvestors : Set Party         -- Track who has invested
+    assetType : Text                    -- e.g., "USDT"
+  where
+    signatory dao, bank
+    observer activeInvestors  -- Investors can see the pool exists (but not internal state of LendingPool)
+    
+    key (dao, bank, poolId) : (Party, Party, Text)
+    maintainer key._2
+    
+    -- | Bank records an investment in the lending pool (helper for Invest)
+    -- This is bank-controlled so it has proper authority
+    nonconsuming choice RecordInvestmentInLendingPool : ContractId LendingPool
+      with
+        amount : Decimal
+      controller bank
+      do
+        exercise lendingPoolCid RecordInvestment with amount
+    
+    -- | Investor contributes capital to the pool
+    -- Creates both position and private returns tracker
+    -- CONSUMING: Pool is archived and recreated with updated state
+    choice Invest : (ContractId InvestmentPool, ContractId InvestorPosition, ContractId PrivateInvestorReturns)
+      with
+        investor : Party
+        amount : Decimal
+      controller investor, bank  -- Both investor and bank must authorize
+      do
+        -- Validate against participation rules first
+        let participationCtx = ParticipationContext
+              with
+                participant = investor
+                role = Investor
+                kycVerified = True  -- TODO: Link to actual KYC contract
+                creditScore = None  -- Not required for investors in MVP
+        
+        rules <- fetch ruleSetCid
+        let participationRules = fromOptional [] (Map.lookup ParticipationRules rules.rulesByCategory)
+        case validateRulesInCategory participationRules ParticipationRules participationCtx of
+          Left err -> abort $ "Participation validation failed: " <> err
+          Right () -> pure ()
+        
+        -- Get existing investment amount if any
+        optExistingCid <- lookupByKey @InvestorPosition (dao, bank, poolId, investor)
+        existingAmount <- case optExistingCid of
+          None -> return None
+          Some existingCid -> do
+            existingPos <- fetch existingCid
+            return $ Some existingPos.investedAmount
+        
+        -- Validate against investment rules
+        let investmentCtx = InvestmentContext
+              with
+                investor
+                investmentAmount = amount
+                assetType
+                currentTotalInvestment = existingAmount
+        
+        let investmentRules = fromOptional [] (Map.lookup InvestmentRules rules.rulesByCategory)
+        case validateRulesInCategory investmentRules InvestmentRules investmentCtx of
+          Left err -> abort $ "Investment validation failed: " <> err
+          Right () -> pure ()
+        
+        -- Check pool capacity
+        canAccept <- exercise lendingPoolCid CanAcceptInvestment with amount
+        assertMsg "Pool cannot accept investment (cap reached)" canAccept
+        
+        -- Update or create investor position
+        now <- getTime
+        positionCid <- case optExistingCid of
+          None -> do
+            -- New investor
+            create InvestorPosition
+              with
+                dao
+                bank
+                poolId
+                investor
+                investedAmount = amount
+                assetType
+                investedAt = now
+                lastDistributionAt = None
+          Some existingCid -> do
+            -- Existing investor adding more
+            existingPos <- fetch existingCid
+            archive existingCid
+            create existingPos with
+              investedAmount = existingPos.investedAmount + amount
+        
+        -- Create or update private investor returns (only this investor sees their returns)
+        optExistingReturns <- lookupByKey @PrivateInvestorReturns (bank, investor, poolId)
+        privateReturnsCid <- case optExistingReturns of
+          None -> do
+            -- New investor - create returns tracker
+            create PrivateInvestorReturns
+              with
+                bank
+                investor
+                poolId
+                investedAmount = amount
+                investmentDate = now
+                totalInterestEarned = 0.0
+                lastDistributionAmount = 0.0
+                lastDistributionDate = None
+                effectiveAPY = 0.0
+                lifetimeReturn = 0.0
+          Some existingReturnsCid -> do
+            -- Existing investor - update returns tracker
+            existingReturns <- fetch existingReturnsCid
+            archive existingReturnsCid
+            create existingReturns with
+              investedAmount = existingReturns.investedAmount + amount
+        
+        -- Update lending pool capitalization (returns new lending pool CID)
+        newLendingPoolCid <- exercise lendingPoolCid RecordInvestment with amount
+        
+        -- Archive old pool and create new one with updated state
+        newPoolCid <- create this with
+          totalInvested = totalInvested + amount
+          activeInvestors = Set.insert investor activeInvestors
+          lendingPoolCid = newLendingPoolCid  -- Store updated lending pool CID
+        
+        return (newPoolCid, positionCid, privateReturnsCid)
+    
+    -- | Annual distribution to all investors (proportional to investment)
+    choice DistributeReturns : ContractId InvestmentPool
+      with
+        totalReturnsToDistribute : Decimal   -- Net returns after DAO fee and bank share
+        distributionDetails : [(Party, Decimal)]  -- Investor -> Amount mapping
+      controller bank
+      do
+        assertMsg "No investors to distribute to" $ not (Set.null activeInvestors)
+        
+        -- Distribution happens by calling RecordDistribution on each PrivateInvestorReturns
+        -- Bank provides pre-calculated amounts for each investor
+        -- In production, would validate that sum equals totalReturnsToDistribute
+        
+        -- For MVP, just mark that distribution happened
+        create this
+    
+    -- | Bank distributes returns to a single investor (called multiple times)
+    nonconsuming choice DistributeToInvestor : ContractId PrivateInvestorReturns
+      with
+        investor : Party
+        distributionAmount : Decimal
+      controller bank
+      do
+        assertMsg "Investor not in pool" $ Set.member investor activeInvestors
+        
+        -- Fetch investor's private returns
+        (returnsCid, _) <- fetchByKey @PrivateInvestorReturns (bank, investor, poolId)
+        
+        -- Record distribution (updates their private returns)
+        exercise returnsCid RecordDistribution with distributionAmount
+    
+    -- | Non-consuming choice to get pool statistics
+    nonconsuming choice GetInvestmentStats : InvestmentStats
+      controller bank
+      do
+        return InvestmentStats
+          with
+            totalCapital = totalInvested
+            numberOfInvestors = Set.size activeInvestors
+            assetType
+
+-- | Individual investor's position in the pool
+template InvestorPosition
+  with
+    dao : Party
+    bank : Party
+    poolId : Text
+    investor : Party
+    investedAmount : Decimal
+    assetType : Text
+    investedAt : Time
+    lastDistributionAt : Optional Time
+  where
+    signatory dao, bank, investor
+    
+    key (dao, bank, poolId, investor) : (Party, Party, Text, Party)
+    maintainer key._4
+    
+    -- | Record distribution to this investor (updates position tracking)
+    choice RecordPositionDistribution : ContractId InvestorPosition
+      with
+        returnAmount : Decimal
+      controller bank
+      do
+        now <- getTime
+        -- In real implementation, would update investor's balance/returns
+        create this with
+          lastDistributionAt = Some now
+
+-- | Statistics for investment pool
+data InvestmentStats = InvestmentStats
+  with
+    totalCapital : Decimal
+    numberOfInvestors : Int
+    assetType : Text
+  deriving (Eq, Show)
+
+-- ============================================================================
+-- HELPER FUNCTIONS
+-- ============================================================================
+
+-- | Create investment pool for a lending pool
+createInvestmentPool : Party -> Party -> Text -> ContractId LendingPool -> ContractId LendingPoolRuleSet -> Text -> Update (ContractId InvestmentPool)
+createInvestmentPool dao bank poolId lendingPoolCid ruleSetCid assetType = do
+  create InvestmentPool
+    with
+      dao
+      bank
+      poolId
+      lendingPoolCid
+      ruleSetCid
+      totalInvested = 0.0
+      activeInvestors = Set.empty
+      assetType

@@ -1,0 +1,674 @@
+-- Test Scripts for Lending Protocol
+-- Happy path scenarios to verify core functionality
+-- Daml 2.10.2 Compatible
+-- Canton Network Hackathon Project
+
+module Scripts.Tests where
+
+import Daml.Script
+import qualified DA.Set as Set
+import qualified DA.Map as Map
+
+import LendingProtocol.Root
+import LendingProtocol.Types
+import LendingProtocol.Bank.Rules
+import LendingProtocol.Bank.LendingPool
+import LendingProtocol.Bank.Pools
+import LendingProtocol.Borrower.Loan
+import LendingProtocol.Oracle
+import LendingProtocol.Privacy
+import LendingProtocol.Regulator
+
+-- ============================================================================
+-- TEST 1: Protocol Setup & Bank Onboarding
+-- ============================================================================
+
+testProtocolSetup : Script ()
+testProtocolSetup = script do
+  -- Allocate parties
+  dao <- allocateParty "DAO"
+  bank <- allocateParty "TestBank"
+  
+  -- DAO creates protocol
+  protocolRootCid <- submit dao do
+    createCmd ProtocolRoot
+      with
+        dao
+        config = ProtocolConfig with
+          daoFeePercentage = 0.5
+          reportingPeriodDays = 30
+        invitedBanks = Map.empty
+        protocolVersion = "1.0.0-TEST"
+  
+  -- DAO invites bank
+  invitationCid <- submit dao do
+    exerciseCmd protocolRootCid InviteBank
+      with
+        bankId = bank
+        bankName = "Test Bank"
+  
+  -- Bank accepts invitation
+  bankSubtreeCid <- submit bank do
+    exerciseCmd invitationCid AcceptInvitation
+  
+  debug "Ã¢Å“â€¦ TEST 1 PASSED: Protocol setup and bank onboarding"
+  return ()
+
+-- ============================================================================
+-- TEST 2: Lending Pool Creation with Rules
+-- ============================================================================
+
+testPoolCreation : Script ()
+testPoolCreation = script do
+  -- Setup
+  dao <- allocateParty "DAO"
+  bank <- allocateParty "TestBank"
+  regulator <- allocateParty "Regulator"
+  
+  -- Create protocol and onboard bank
+  protocolRootCid <- submit dao do
+    createCmd ProtocolRoot
+      with
+        dao
+        config = ProtocolConfig with
+          daoFeePercentage = 0.5
+          reportingPeriodDays = 30
+        invitedBanks = Map.empty
+        protocolVersion = "1.0.0-TEST"
+  
+  invitationCid <- submit dao do
+    exerciseCmd protocolRootCid InviteBank
+      with
+        bankId = bank
+        bankName = "Test Bank"
+  
+  bankSubtreeCid <- submit bank do
+    exerciseCmd invitationCid AcceptInvitation
+  
+  -- Bank invites regulator
+  bankSubtreeCid <- submit bank do
+    exerciseCmd bankSubtreeCid InviteRegulator with regulator
+  
+  -- Define initial rules
+  now <- getTime
+  let kycRule = Rule with
+        ruleId = "kyc-1"
+        category = ParticipationRules
+        ruleType = RequireKyc
+        enabled = True
+        description = "KYC required for all participants"
+        createdAt = now
+        updatedAt = now
+  
+  let creditScoreRule = Rule with
+        ruleId = "credit-1"
+        category = BorrowingRules
+        ruleType = MinimumCreditScoreForRole with role = Borrower; minScore = 650
+        enabled = True
+        description = "Borrowers need 650+ credit score"
+        createdAt = now
+        updatedAt = now
+  
+  let collateralRule = Rule with
+        ruleId = "collateral-1"
+        category = BorrowingRules
+        ruleType = MinimumCollateralRatio with ratio = 1.2
+        enabled = True
+        description = "120% collateral ratio required"
+        createdAt = now
+        updatedAt = now
+  
+  -- Bank proposes lending pool
+  now2 <- getTime
+  proposalCid <- submit bank do
+    createCmd LendingPoolProposal
+      with
+        dao
+        bank
+        poolId = "test-pool-1"
+        poolName = "Test Lending Pool"
+        poolDescription = "Conservative lending pool for testing"
+        maxTotalCapitalization = 1000000.0
+        initialRules = [kycRule, creditScoreRule, collateralRule]
+        regulators = Set.singleton regulator
+        proposedAt = now2
+  
+  -- DAO approves pool
+  lendingPoolCid <- submit dao do
+    exerciseCmd proposalCid ApprovePoolCreation
+  
+  debug "Ã¢Å“â€¦ TEST 2 PASSED: Lending pool created with rules"
+  return ()
+
+-- ============================================================================
+-- TEST 3: Investor Investment Flow
+-- ============================================================================
+
+testInvestorFlow : Script ()
+testInvestorFlow = script do
+  -- Setup
+  debug "===== TEST 3: Starting testInvestorFlow ====="
+  dao <- allocateParty "DAO"
+  bank <- allocateParty "TestBank"
+  investor <- allocateParty "Alice"
+  regulator <- allocateParty "Regulator"
+  
+  -- Create pool (reusing setup from test 2)
+  (protocolRootCid, bankSubtreeCid, lendingPoolCid, ruleSetCid) <- setupBasicPool dao bank regulator
+  
+  -- Create investment pool
+  investmentPoolCid <- submitMulti [dao, bank] [] do
+    createCmd InvestmentPool
+      with
+        dao
+        bank
+        poolId = "test-pool-1"
+        lendingPoolCid
+        ruleSetCid
+        totalInvested = 0.0
+        activeInvestors = Set.empty
+        assetType = "USDT"
+  
+  -- Investor invests (returns NEW pool contract ID after consuming old one)
+  debug "TEST 3: Investor calling Invest"
+  (newPoolCid, positionCid, privateReturnsCid) <- submitMulti [investor, bank] [] do
+    exerciseCmd investmentPoolCid Invest
+      with
+        investor
+        amount = 50000.0
+  debug "TEST 3: Invest complete"
+  
+  -- Verify investment was recorded using the NEW pool contract
+  Some pool <- queryContractId bank newPoolCid
+  assert $ pool.totalInvested == 50000.0
+  
+  debug "Ã¢Å“â€¦ TEST 3 PASSED: Investor successfully invested"
+  return ()
+
+-- ============================================================================
+-- TEST 4: Oracle Integration & KYC Verification
+-- ============================================================================
+
+testOracleKycFlow : Script ()
+testOracleKycFlow = script do
+  -- Setup
+  dao <- allocateParty "DAO"
+  bank <- allocateParty "TestBank"
+  borrower <- allocateParty "Bob"
+  kycOracle <- allocateParty "KYCOracle"
+  regulator <- allocateParty "Regulator"
+  
+  -- Create KYC oracle
+  kycOracleCid <- submit kycOracle do
+    createCmd KycOracle
+      with
+        oracle = kycOracle
+        supportedBanks = Set.singleton bank
+        serviceName = "Test KYC Service"
+  
+  -- Create loan application
+  debug ("DEBUG: borrower = " <> show borrower)
+  debug ("DEBUG: bank = " <> show bank)
+  now <- getTime
+  applicationCid <- submitMulti [borrower, bank] [] do
+    createCmd LoanApplication
+      with
+        dao
+        bank
+        poolId = "test-pool-1"
+        borrower
+        requestedAmount = 30000.0
+        proposedCollateralValue = 40000.0
+        proposedTermDays = 365
+        proposedInterestRate = 0.08
+        assetType = "USDT"
+        collateralAssetType = "BTC"
+        kycStatus = KycPending
+        kycResultCid = None
+        creditScore = None
+        creditScoreResultCid = None
+        assetValuationCid = None
+        appliedAt = now
+  
+  -- Bank requests KYC from oracle
+  kycRequestCid <- submit bank do
+    exerciseCmd applicationCid RequestKycFromOracle
+      with
+        kycOracleCid
+        requestId = "kyc-test-1"
+  
+  -- Oracle provides KYC result
+  kycResultCid <- submitMulti [kycOracle, bank] [] do
+    exerciseCmd kycRequestCid ProvideKycResult
+      with
+        result = KycVerificationResult with
+          verified = True
+          riskScore = 25
+          verificationType = "passport"
+          verificationDate = now
+          expiryDate = None
+  
+  -- Bank receives KYC result and creates private data
+  (newApplicationCid, privateKycCid) <- submitMulti [bank, borrower] [] do
+    exerciseCmd applicationCid ReceiveKycResult
+      with
+        kycResultCid
+        regulator
+        fullName = "Bob Smith"
+        nationalId = "123-45-6789"
+        address = "123 Main St"
+        phone = "+1234567890"
+        email = "bob@example.com"
+  
+  -- Verify KYC status updated (use the NEW application CID)
+  Some application <- queryContractId bank newApplicationCid
+  assert $ application.kycStatus == KycApproved
+  
+  debug "Ã¢Å“â€¦ TEST 4 PASSED: Oracle KYC verification flow"
+  return ()
+
+-- ============================================================================
+-- TEST 5: Complete Loan Lifecycle (Happy Path)
+-- ============================================================================
+
+testCompleteLoanCycle : Script ()
+testCompleteLoanCycle = script do
+  -- Setup parties
+  dao <- allocateParty "DAO"
+  bank <- allocateParty "TestBank"
+  investor <- allocateParty "Alice"
+  borrower <- allocateParty "Bob"
+  regulator <- allocateParty "Regulator"
+  kycOracle <- allocateParty "KYCOracle"
+  
+  -- Setup pool and investment
+  (lendingPoolCid, investmentPoolCid, ruleSetCid) <- setupPoolWithInvestment dao bank investor regulator
+  
+  -- Setup KYC oracle
+  kycOracleCid <- submit kycOracle do
+    createCmd KycOracle
+      with
+        oracle = kycOracle
+        supportedBanks = Set.singleton bank
+        serviceName = "Test KYC Service"
+  
+  -- Borrower submits application
+  now <- getTime
+  applicationCid <- submitMulti [borrower, bank] [] do
+    createCmd LoanApplication
+      with
+        dao
+        bank
+        poolId = "test-pool-1"
+        borrower
+        requestedAmount = 30000.0
+        proposedCollateralValue = 40000.0
+        proposedTermDays = 365
+        proposedInterestRate = 0.08
+        assetType = "USDT"
+        collateralAssetType = "BTC"
+        kycStatus = KycPending
+        kycResultCid = None
+        creditScore = Some 720
+        creditScoreResultCid = None
+        assetValuationCid = None
+        appliedAt = now
+  
+  -- KYC flow
+  kycRequestCid <- submit bank do
+    exerciseCmd applicationCid RequestKycFromOracle
+      with
+        kycOracleCid
+        requestId = "kyc-loan-1"
+  
+  kycResultCid <- submitMulti [kycOracle, bank] [] do
+    exerciseCmd kycRequestCid ProvideKycResult
+      with
+        result = KycVerificationResult with
+          verified = True
+          riskScore = 20
+          verificationType = "passport"
+          verificationDate = now
+          expiryDate = None
+  
+  (newApplicationCid, privateKycCid) <- submitMulti [bank, borrower] [] do
+    exerciseCmd applicationCid ReceiveKycResult
+      with
+        kycResultCid
+        regulator
+        fullName = "Bob Smith"
+        nationalId = "123-45-6789"
+        address = "123 Main St"
+        phone = "+1234567890"
+        email = "bob@example.com"
+  
+  -- Bank approves and funds loan (use the NEW application CID)
+  (loanCid, collateralCid, trackerCid, privateLoanCid, publicSummaryCid) <-
+    submitMulti [bank, borrower] [] do
+      exerciseCmd newApplicationCid ApproveLoan
+        with
+          lendingPoolCid
+          investmentPoolCid
+          ruleSetCid
+          approvedAmount = 30000.0
+          approvedTermDays = 365
+          approvedInterestRate = 0.08
+          regulator
+          investors = Set.singleton investor
+  
+  -- Borrower makes a payment
+  (newLoanCid, newTrackerCid) <- submit borrower do
+    exerciseCmd loanCid MakePayment
+      with
+        paymentAmount = 3000.0
+        interestPortion = 200.0
+        principalPortion = 2800.0
+  
+  -- Verify payment recorded
+  Some tracker <- queryContractId bank newTrackerCid
+  assert $ tracker.totalPaid == 3000.0
+  
+  debug "Ã¢Å“â€¦ TEST 5 PASSED: Complete loan lifecycle"
+  return ()
+
+-- ============================================================================
+-- TEST 6: Privacy Features
+-- ============================================================================
+
+testPrivacyFeatures : Script ()
+testPrivacyFeatures = script do
+  dao <- allocateParty "DAO"
+  bank <- allocateParty "TestBank"
+  borrower <- allocateParty "Bob"
+  investor1 <- allocateParty "Alice"
+  investor2 <- allocateParty "Carol"
+  regulator <- allocateParty "Regulator"
+  
+  now <- getTime
+  
+  -- Create private KYC data (only bank, borrower, regulator can see)
+  privateKycCid <- submitMulti [bank, borrower] [] do
+    createCmd PrivateKYCData
+      with
+        bank
+        borrower
+        regulator
+        fullName = "Bob Smith"
+        dateOfBirth = "1990-01-01"
+        nationalId = "123-45-6789"
+        nationality = "US"
+        residentialAddress = "123 Main St"
+        phoneNumber = "+1234567890"
+        emailAddress = "bob@example.com"
+        documentType = "passport"
+        documentNumber = "123-45-6789"
+        documentIssuer = "US Government"
+        documentExpiry = "2030-01-01"
+        politicallyExposed = False
+        sanctionsList = False
+        adverseMediaCheck = False
+        riskLevel = "low"
+        verifiedAt = now
+        verifiedBy = bank
+        kycReference = "kyc-001"
+  
+  -- Bank and borrower can see it
+  kycData1 <- queryContractId bank privateKycCid
+  case kycData1 of
+    None -> abort "Bank should be able to see private KYC"
+    Some _ -> pure ()
+  
+  kycData2 <- queryContractId borrower privateKycCid
+  case kycData2 of
+    None -> abort "Borrower should be able to see private KYC"
+    Some _ -> pure ()
+  
+  -- Investor CANNOT see it (not an observer)
+  -- This would fail: submit investor1 do queryContractId investor1 privateKycCid
+  
+  -- Create public summary (investors CAN see)
+  publicSummaryCid <- submit bank do
+    createCmd PublicLoanSummary
+      with
+        bank
+        investors = Set.fromList [investor1, investor2]
+        poolId = "test-pool-1"
+        loanId = "loan-001"
+        loanAmountBucket = "$25-50K"  -- NOT exact amount!
+        interestRateBucket = "7-10%"  -- NOT exact rate!
+        termBucket = "1-3yr"
+        collateralTypeBucket = "BTC"
+        ltvRatioBucket = "70-80%"
+        creditScoreBucket = "good"  -- NOT exact score!
+        loanStatus = "active"
+        issuedAt = now
+  
+  -- Investors can see bucketed summary
+  summary1 <- queryContractId investor1 publicSummaryCid
+  case summary1 of
+    None -> abort "Investor1 should be able to see public summary"
+    Some _ -> pure ()
+  
+  summary2 <- queryContractId investor2 publicSummaryCid
+  case summary2 of
+    None -> abort "Investor2 should be able to see public summary"
+    Some _ -> pure ()
+  
+  -- Create private investor returns (each investor sees only theirs)
+  aliceReturnsCid <- submitMulti [bank, investor1] [] do
+    createCmd PrivateInvestorReturns
+      with
+        bank
+        investor = investor1
+        poolId = "test-pool-1"
+        investedAmount = 50000.0
+        investmentDate = now
+        totalInterestEarned = 2500.0
+        lastDistributionAmount = 2500.0
+        lastDistributionDate = Some now
+        effectiveAPY = 5.0
+        lifetimeReturn = 2500.0
+  
+  carolReturnsCid <- submitMulti [bank, investor2] [] do
+    createCmd PrivateInvestorReturns
+      with
+        bank
+        investor = investor2
+        poolId = "test-pool-1"
+        investedAmount = 30000.0
+        investmentDate = now
+        totalInterestEarned = 1500.0
+        lastDistributionAmount = 1500.0
+        lastDistributionDate = Some now
+        effectiveAPY = 5.0
+        lifetimeReturn = 1500.0
+  
+  -- Alice can see her returns
+  aliceReturns <- queryContractId investor1 aliceReturnsCid
+  case aliceReturns of
+    None -> abort "Alice should be able to see her returns"
+    Some _ -> pure ()
+  
+  -- Carol can see her returns
+  carolReturns <- queryContractId investor2 carolReturnsCid
+  case carolReturns of
+    None -> abort "Carol should be able to see her returns"
+    Some _ -> pure ()
+  
+  -- Alice CANNOT see Carol's returns (not observer)
+  -- This would fail: submit investor1 do queryContractId investor1 carolReturnsCid
+  
+  debug "Ã¢Å“â€¦ TEST 6 PASSED: Privacy features working correctly"
+  return ()
+
+-- ============================================================================
+-- TEST 7: Regulatory Reporting
+-- ============================================================================
+
+testRegulatoryReporting : Script ()
+testRegulatoryReporting = script do
+  dao <- allocateParty "DAO"
+  bank <- allocateParty "TestBank"
+  regulator <- allocateParty "Regulator"
+  
+  now <- getTime
+  
+  -- Create report schedule
+  reportScheduleCid <- submitMulti [dao, bank] [] do
+    createCmd ReportSchedule
+      with
+        dao
+        bank
+        poolId = "test-pool-1"
+        regulators = Set.singleton regulator
+        reportingFrequencyDays = 30
+        lastReportDate = None
+        nextReportDue = now
+  
+  -- Generate report
+  let metrics = ReportMetrics with
+        totalActiveLoans = 5
+        totalLoanVolume = 150000.0
+        totalDefaultedLoans = 0
+        totalDefaultedVolume = 0.0
+        averageInterestRate = 0.08
+        totalKycVerified = 5
+        totalKycPending = 0
+        totalKycRejected = 0
+        averageCreditScore = Some 720.0
+        averageCollateralRatio = 1.25
+        loansAtRisk = 0
+        totalInterestCollected = 5000.0
+        totalPrincipalRepaid = 10000.0
+        daoFeesCollected = 25.0
+        outstandingPrincipal = 140000.0
+        totalInvestors = 3
+        totalInvestedCapital = 200000.0
+  
+  (newScheduleCid, reportCid) <- submit bank do
+    exerciseCmd reportScheduleCid GenerateReport with metrics
+  
+  -- Regulator acknowledges report
+  acknowledgedReportCid <- submit regulator do
+    exerciseCmd reportCid AcknowledgeReport
+      with
+        regulator
+        notes = Some "Report reviewed and approved"
+  
+  -- Verify report acknowledged
+  Some report <- queryContractId regulator acknowledgedReportCid
+  assert $ report.reportStatus == Acknowledged
+  
+  debug "Ã¢Å“â€¦ TEST 7 PASSED: Regulatory reporting working"
+  return ()
+
+-- ============================================================================
+-- HELPER FUNCTIONS
+-- ============================================================================
+
+-- Setup basic pool with rules
+setupBasicPool : Party -> Party -> Party -> Script (ContractId ProtocolRoot, ContractId BankSubtree, ContractId LendingPool, ContractId LendingPoolRuleSet)
+setupBasicPool dao bank regulator = do
+  -- Create protocol
+  protocolRootCid <- submit dao do
+    createCmd ProtocolRoot
+      with
+        dao
+        config = ProtocolConfig with
+          daoFeePercentage = 0.5
+          reportingPeriodDays = 30
+        invitedBanks = Map.empty
+        protocolVersion = "1.0.0-TEST"
+  
+  -- Onboard bank
+  invitationCid <- submit dao do
+    exerciseCmd protocolRootCid InviteBank
+      with
+        bankId = bank
+        bankName = "Test Bank"
+  
+  bankSubtreeCid <- submit bank do
+    exerciseCmd invitationCid AcceptInvitation
+  
+  bankSubtreeCid <- submit bank do
+    exerciseCmd bankSubtreeCid InviteRegulator with regulator
+  
+  -- Create pool
+  now <- getTime
+  let kycRule = Rule with
+        ruleId = "kyc-1"
+        category = ParticipationRules
+        ruleType = RequireKyc
+        enabled = True
+        description = "KYC required"
+        createdAt = now
+        updatedAt = now
+  
+  now2 <- getTime
+  proposalCid <- submit bank do
+    createCmd LendingPoolProposal
+      with
+        dao
+        bank
+        poolId = "test-pool-1"
+        poolName = "Test Pool"
+        poolDescription = "Test lending pool"
+        maxTotalCapitalization = 1000000.0
+        initialRules = [kycRule]
+        regulators = Set.singleton regulator
+        proposedAt = now2
+  
+  (lendingPoolCid, ruleSetCid) <- submit dao do
+    exerciseCmd proposalCid ApprovePoolCreation
+  
+  return (protocolRootCid, bankSubtreeCid, lendingPoolCid, ruleSetCid)
+
+-- Setup pool with investment
+setupPoolWithInvestment : Party -> Party -> Party -> Party -> Script (ContractId LendingPool, ContractId InvestmentPool, ContractId LendingPoolRuleSet)
+setupPoolWithInvestment dao bank investor regulator = do
+  (_, _, lendingPoolCid, ruleSetCid) <- setupBasicPool dao bank regulator
+  
+  investmentPoolCid <- submitMulti [dao, bank] [] do
+    createCmd InvestmentPool
+        with
+          dao
+          bank
+          poolId = "test-pool-1"
+          lendingPoolCid
+          ruleSetCid
+          totalInvested = 0.0
+          activeInvestors = Set.empty
+          assetType = "USDT"
+  
+  (newInvestmentPoolCid, _, _) <- submitMulti [investor, bank] [] do
+    exerciseCmd investmentPoolCid Invest
+      with
+        investor
+        amount = 100000.0
+  
+  -- Fetch the new investment pool to get the updated lending pool CID
+  Some newPool <- queryContractId bank newInvestmentPoolCid
+  
+  return (newPool.lendingPoolCid, newInvestmentPoolCid, ruleSetCid)
+
+-- ============================================================================
+-- RUN ALL TESTS
+-- ============================================================================
+
+runAllTests : Script ()
+runAllTests = script do
+  debug "========================================="
+  debug "Running Lending Protocol Test Suite"
+  debug "========================================="
+  
+  testProtocolSetup
+  testPoolCreation
+  testInvestorFlow
+  testOracleKycFlow
+  testCompleteLoanCycle
+  testPrivacyFeatures
+  testRegulatoryReporting
+  
+  debug "========================================="
+  debug "Ã¢Å“â€¦ ALL TESTS PASSED!"
+  debug "========================================="

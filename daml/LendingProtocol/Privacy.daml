@@ -1,0 +1,345 @@
+-- Privacy-Preserving KYC and Loan Data
+-- Demonstrates Canton's Sub-Transaction Privacy
+-- Daml 2.10.2 Compatible
+-- Canton Network Hackathon Project
+
+module LendingProtocol.Privacy where
+
+import DA.Set (Set)
+
+-- ============================================================================
+-- PRIVATE KYC DATA
+-- ============================================================================
+
+-- | Private KYC data - only visible to bank, regulator, and borrower
+-- This is Canton's KILLER FEATURE - on Ethereum, everyone would see this!
+template PrivateKYCData
+  with
+    bank : Party
+    borrower : Party
+    regulator : Party
+    
+    -- Sensitive personal information
+    fullName : Text
+    dateOfBirth : Text
+    nationalId : Text              -- SSN, Passport, etc.
+    nationality : Text
+    residentialAddress : Text
+    phoneNumber : Text
+    emailAddress : Text
+    
+    -- Verification details
+    documentType : Text            -- "passport", "drivers_license", etc.
+    documentNumber : Text
+    documentIssuer : Text
+    documentExpiry : Text
+    
+    -- Risk assessment
+    politicallyExposed : Bool      -- PEP status
+    sanctionsList : Bool           -- On sanctions list
+    adverseMediaCheck : Bool       -- Negative news
+    riskLevel : Text               -- "low", "medium", "high"
+    
+    -- Metadata
+    verifiedAt : Time
+    verifiedBy : Party             -- Bank or KYC oracle
+    kycReference : Text            -- Link to KYC oracle result
+  where
+    signatory bank  -- Only bank signs (creates from oracle verification)
+    observer borrower, regulator  -- Both can view the data
+    
+    key (bank, borrower) : (Party, Party)
+    maintainer key._1  -- Bank is maintainer since bank is signatory
+    
+    -- | Update risk assessment
+    choice UpdateRiskAssessment : ContractId PrivateKYCData
+      with
+        newRiskLevel : Text
+        newPepStatus : Bool
+        newSanctionsStatus : Bool
+        newAdverseMedia : Bool
+      controller bank
+      do
+        create this with
+          politicallyExposed = newPepStatus
+          sanctionsList = newSanctionsStatus
+          adverseMediaCheck = newAdverseMedia
+          riskLevel = newRiskLevel
+    
+    -- | Mark for re-verification (annual refresh)
+    choice RequestReverification : ContractId KYCReverificationRequest
+      controller bank
+      do
+        now <- getTime
+        create KYCReverificationRequest
+          with
+            bank
+            borrower
+            regulator
+            originalKycReference = kycReference
+            requestedAt = now
+            reason = "Annual KYC refresh"
+
+-- | KYC reverification request (for periodic updates)
+template KYCReverificationRequest
+  with
+    bank : Party
+    borrower : Party
+    regulator : Party
+    originalKycReference : Text
+    requestedAt : Time
+    reason : Text
+  where
+    signatory bank
+    observer borrower, regulator
+    
+    -- | Borrower provides updated documents
+    choice ProvideUpdatedDocuments : ContractId PrivateKYCData
+      with
+        updatedData : PrivateKYCData
+      controller borrower
+      do
+        -- Archive request and create new KYC data
+        create updatedData
+
+-- ============================================================================
+-- PRIVATE LOAN TERMS
+-- ============================================================================
+
+-- | Private loan agreement - terms visible only to involved parties
+-- Investors see the pool but NOT individual borrower terms
+template PrivateLoanAgreement
+  with
+    bank : Party
+    borrower : Party
+    regulator : Party
+    
+    poolId : Text
+    loanId : Text
+    
+    -- Loan terms (private from other borrowers/investors)
+    loanAmount : Decimal
+    interestRate : Decimal
+    termDays : Int
+    monthlyPayment : Decimal
+    
+    -- Collateral details (private)
+    collateralType : Text
+    collateralDescription : Text   -- "123 Main St, 3BR house" - detailed info
+    collateralValue : Decimal
+    
+    -- Special terms (private negotiations)
+    gracePeriodDays : Int          -- Days allowed after due date
+    prepaymentPenalty : Optional Decimal
+    latePaymentPenalty : Decimal
+    specialConditions : Optional Text  -- Custom terms
+    
+    agreedAt : Time
+  where
+    signatory bank, borrower
+    observer regulator
+    
+    key (bank, borrower, loanId) : (Party, Party, Text)
+    maintainer key._2
+    
+    -- | Amend loan terms (refinancing)
+    choice AmendLoanTerms : ContractId PrivateLoanAgreement
+      with
+        newInterestRate : Optional Decimal
+        newTermDays : Optional Int
+        newGracePeriod : Optional Int
+        amendment : Text
+      controller bank, borrower
+      do
+        let updatedRate = case newInterestRate of
+              Some r -> r
+              None -> interestRate
+        let updatedTerm = case newTermDays of
+              Some t -> t
+              None -> termDays
+        let updatedGrace = case newGracePeriod of
+              Some g -> g
+              None -> gracePeriodDays
+        
+        create this with
+          interestRate = updatedRate
+          termDays = updatedTerm
+          gracePeriodDays = updatedGrace
+          specialConditions = Some amendment
+
+-- ============================================================================
+-- PRIVACY-PRESERVING LOAN SUMMARY (for investors)
+-- ============================================================================
+
+-- | Public loan summary - what investors CAN see
+-- No borrower identity, just aggregated metrics
+template PublicLoanSummary
+  with
+    bank : Party
+    investors : Set Party          -- Pool investors can see this
+    
+    poolId : Text
+    loanId : Text
+    
+    -- Anonymized loan info
+    loanAmountBucket : Text        -- "$0-50K", "$50-100K", etc. (not exact amount)
+    interestRateBucket : Text      -- "5-7%", "7-10%", etc.
+    termBucket : Text              -- "0-1yr", "1-3yr", "3-5yr", etc.
+    collateralTypeBucket : Text    -- "real_estate", "securities", etc. (no details)
+    ltvRatioBucket : Text          -- "60-70%", "70-80%", etc.
+    creditScoreBucket : Text       -- "excellent", "good", "fair" (not exact score)
+    
+    loanStatus : Text              -- "active", "completed", "defaulted"
+    issuedAt : Time
+  where
+    signatory bank
+    observer investors
+    
+    key (bank, poolId, loanId) : (Party, Text, Text)
+    maintainer key._1
+    
+    -- | Update status when loan completes/defaults
+    choice UpdateLoanStatus : ContractId PublicLoanSummary
+      with
+        newStatus : Text
+      controller bank
+      do
+        create this with
+          loanStatus = newStatus
+
+-- ============================================================================
+-- PRIVACY-PRESERVING INVESTOR POSITION
+-- ============================================================================
+
+-- | Private investor returns - each investor sees only THEIR returns
+-- Investors cannot see other investors' positions or returns
+template PrivateInvestorReturns
+  with
+    bank : Party
+    investor : Party
+    poolId : Text
+    
+    -- Private investment details
+    investedAmount : Decimal
+    investmentDate : Time
+    
+    -- Private returns (other investors can't see this)
+    totalInterestEarned : Decimal
+    lastDistributionAmount : Decimal
+    lastDistributionDate : Optional Time
+    
+    -- Performance metrics (private)
+    effectiveAPY : Decimal         -- Actual return rate
+    lifetimeReturn : Decimal       -- Total profit
+  where
+    signatory bank, investor
+    
+    key (bank, investor, poolId) : (Party, Party, Text)
+    maintainer key._2
+    
+    -- | Record distribution
+    choice RecordDistribution : ContractId PrivateInvestorReturns
+      with
+        distributionAmount : Decimal
+      controller bank
+      do
+        now <- getTime
+        let newTotalInterest = totalInterestEarned + distributionAmount
+        let newLifetimeReturn = newTotalInterest
+        let newAPY = (newTotalInterest / investedAmount) * 100.0
+        
+        create this with
+          totalInterestEarned = newTotalInterest
+          lastDistributionAmount = distributionAmount
+          lastDistributionDate = Some now
+          effectiveAPY = newAPY
+          lifetimeReturn = newLifetimeReturn
+
+-- ============================================================================
+-- HELPER FUNCTIONS
+-- ============================================================================
+
+-- | Create private KYC data from oracle result
+createPrivateKycFromOracle : Party -> Party -> Party -> Text -> Text -> Text -> Text -> Text -> Time -> Party -> Text -> Update (ContractId PrivateKYCData)
+createPrivateKycFromOracle bank borrower regulator fullName nationalId address phone email verifiedAt verifiedBy kycRef = do
+  create PrivateKYCData
+    with
+      bank
+      borrower
+      regulator
+      fullName
+      dateOfBirth = ""  -- Would be provided
+      nationalId
+      nationality = ""  -- Would be provided
+      residentialAddress = address
+      phoneNumber = phone
+      emailAddress = email
+      documentType = "passport"
+      documentNumber = nationalId
+      documentIssuer = "Government"
+      documentExpiry = "2030-01-01"
+      politicallyExposed = False
+      sanctionsList = False
+      adverseMediaCheck = False
+      riskLevel = "low"
+      verifiedAt
+      verifiedBy
+      kycReference = kycRef
+
+-- | Bucket loan amount for privacy (investors see range, not exact)
+bucketLoanAmount : Decimal -> Text
+bucketLoanAmount amount
+  | amount < 10000.0 = "$0-10K"
+  | amount < 25000.0 = "$10-25K"
+  | amount < 50000.0 = "$25-50K"
+  | amount < 100000.0 = "$50-100K"
+  | amount < 250000.0 = "$100-250K"
+  | amount < 500000.0 = "$250-500K"
+  | otherwise = "$500K+"
+
+-- | Bucket interest rate for privacy
+bucketInterestRate : Decimal -> Text
+bucketInterestRate rate
+  | rate < 0.05 = "0-5%"
+  | rate < 0.07 = "5-7%"
+  | rate < 0.10 = "7-10%"
+  | rate < 0.15 = "10-15%"
+  | otherwise = "15%+"
+
+-- | Bucket loan term for privacy
+bucketLoanTerm : Int -> Text
+bucketLoanTerm days
+  | days < 365 = "0-1yr"
+  | days < 1095 = "1-3yr"
+  | days < 1825 = "3-5yr"
+  | otherwise = "5yr+"
+
+-- | Bucket credit score for privacy
+bucketCreditScore : Int -> Text
+bucketCreditScore score
+  | score >= 750 = "excellent"
+  | score >= 700 = "good"
+  | score >= 650 = "fair"
+  | otherwise = "poor"
+
+-- | Create public loan summary from private data
+createPublicSummary : Party -> Set Party -> Text -> Text -> Decimal -> Decimal -> Int -> Text -> Decimal -> Int -> Time -> Update (ContractId PublicLoanSummary)
+createPublicSummary bank investors poolId loanId loanAmount interestRate termDays collateralType collateralValue creditScore issuedAt = do
+  let ltvRatio = loanAmount / collateralValue
+  
+  create PublicLoanSummary
+    with
+      bank
+      investors
+      poolId
+      loanId
+      loanAmountBucket = bucketLoanAmount loanAmount
+      interestRateBucket = bucketInterestRate interestRate
+      termBucket = bucketLoanTerm termDays
+      collateralTypeBucket = collateralType
+      ltvRatioBucket = if ltvRatio < 0.7 then "60-70%" 
+                       else if ltvRatio < 0.8 then "70-80%"
+                       else "80%+"
+      creditScoreBucket = bucketCreditScore creditScore
+      loanStatus = "active"
+      issuedAt

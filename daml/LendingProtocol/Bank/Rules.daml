@@ -1,0 +1,350 @@
+-- Rules System for Lending Protocol
+-- Daml 2.10.2 Compatible
+-- Canton Network Hackathon Project
+
+module LendingProtocol.Bank.Rules where
+
+import DA.Map (Map)
+import qualified DA.Map as Map
+import DA.Set (Set)
+import qualified DA.Set as Set
+import DA.Optional (isSome, fromOptional)
+import LendingProtocol.Types
+
+-- | Validate a single rule against a context
+validateRule : Rule -> ValidationContext -> Either Text ()
+validateRule rule ctx = 
+  if not rule.enabled 
+    then Right ()  -- Disabled rules always pass
+    else case (rule.ruleType, ctx) of
+      -- PARTICIPATION RULES
+      (BlacklistedParty blockedParty, ParticipationContext participant _ _ _) ->
+        if participant == blockedParty
+          then Left $ "Party " <> show participant <> " is blacklisted"
+          else Right ()
+      
+      (WhitelistedPartiesOnly allowedParties, ParticipationContext participant _ _ _) ->
+        if contains participant allowedParties
+          then Right ()
+          else Left $ "Party " <> show participant <> " is not whitelisted"
+      
+      (RequireKyc, ParticipationContext _ _ kycVerified _) ->
+        if kycVerified
+          then Right ()
+          else Left "KYC verification required"
+      
+      (MinimumCreditScoreForRole requiredRole minScore, ParticipationContext _ actualRole _ (Some actualScore)) ->
+        if (requiredRole == AnyRole || requiredRole == actualRole) && actualScore >= minScore
+          then Right ()
+          else Left $ "Credit score " <> show actualScore <> " below minimum " <> show minScore <> " for role " <> show actualRole
+      
+      (MinimumCreditScoreForRole _ _, ParticipationContext _ _ _ None) ->
+        Left "Credit score required but not provided"
+      
+      -- INVESTMENT RULES
+      (MinimumInvestmentAmount minAmount, InvestmentContext _ amount _ _) ->
+        if amount >= minAmount
+          then Right ()
+          else Left $ "Investment amount " <> show amount <> " below minimum " <> show minAmount
+      
+      (MaximumInvestmentPerParty maxAmount, InvestmentContext _ newAmount _ (Some currentAmount)) ->
+        let totalAmount = currentAmount + newAmount
+        in if totalAmount <= maxAmount
+             then Right ()
+             else Left $ "Total investment " <> show totalAmount <> " exceeds maximum " <> show maxAmount
+      
+      (MaximumInvestmentPerParty maxAmount, InvestmentContext _ newAmount _ None) ->
+        if newAmount <= maxAmount
+          then Right ()
+          else Left $ "Investment amount " <> show newAmount <> " exceeds maximum " <> show maxAmount
+      
+      (AllowedInvestmentAssets allowedAssets, InvestmentContext _ _ assetType _) ->
+        if contains assetType allowedAssets
+          then Right ()
+          else Left $ "Asset type '" <> assetType <> "' not allowed for investment"
+      
+      -- BORROWING RULES
+      (MinimumCollateralRatio minRatio, BorrowingContext _ _ _ loanAmount collateralValue _ _ _) ->
+        let actualRatio = collateralValue / loanAmount
+        in if actualRatio >= minRatio
+             then Right ()
+             else Left $ "Collateral ratio " <> show actualRatio <> " below minimum " <> show minRatio
+      
+      (AllowedBorrowAssets allowedAssets, BorrowingContext _ _ _ _ _ _ _ assetType) ->
+        if contains assetType allowedAssets
+          then Right ()
+          else Left $ "Asset type '" <> assetType <> "' not allowed for borrowing"
+      
+      (MinimumLoanAmount minAmount, BorrowingContext _ _ _ loanAmount _ _ _ _) ->
+        if loanAmount >= minAmount
+          then Right ()
+          else Left $ "Loan amount " <> show loanAmount <> " below minimum " <> show minAmount
+      
+      (MaximumLoanAmount maxAmount, BorrowingContext _ _ _ loanAmount _ _ _ _) ->
+        if loanAmount <= maxAmount
+          then Right ()
+          else Left $ "Loan amount " <> show loanAmount <> " exceeds maximum " <> show maxAmount
+      
+      (MinimumLoanTermDays minDays, BorrowingContext _ _ _ _ _ termDays _ _) ->
+        if termDays >= minDays
+          then Right ()
+          else Left $ "Loan term " <> show termDays <> " days below minimum " <> show minDays <> " days"
+      
+      (MaximumLoanTermDays maxDays, BorrowingContext _ _ _ _ _ termDays _ _) ->
+        if termDays <= maxDays
+          then Right ()
+          else Left $ "Loan term " <> show termDays <> " days exceeds maximum " <> show maxDays <> " days"
+      
+      (MinimumInterestRate minRate, BorrowingContext _ _ _ _ _ _ interestRate _) ->
+        if interestRate >= minRate
+          then Right ()
+          else Left $ "Interest rate " <> show interestRate <> " below minimum " <> show minRate
+      
+      (MaximumInterestRate maxRate, BorrowingContext _ _ _ _ _ _ interestRate _) ->
+        if interestRate <= maxRate
+          then Right ()
+          else Left $ "Interest rate " <> show interestRate <> " exceeds maximum " <> show maxRate
+      
+      -- Credit score check in borrowing context
+      (MinimumCreditScoreForRole requiredRole minScore, BorrowingContext _ _ (Some actualScore) _ _ _ _ _) ->
+        if (requiredRole == AnyRole || requiredRole == Borrower) && actualScore >= minScore
+          then Right ()
+          else Left $ "Credit score " <> show actualScore <> " below minimum " <> show minScore <> " for borrowing"
+      
+      (MinimumCreditScoreForRole _ _, BorrowingContext _ _ None _ _ _ _ _) ->
+        Left "Credit score required for borrowing but not provided"
+      
+      (RequireKyc, BorrowingContext _ kycVerified _ _ _ _ _ _) ->
+        if kycVerified
+          then Right ()
+          else Left "KYC verification required for borrowing"
+      
+      -- WITHDRAWAL RULES
+      (AnnualDistributionOnly, WithdrawalContext _ _ _) ->
+        Left "Mid-term withdrawals not allowed. Only annual distribution is permitted."
+      
+      -- Rule/Context mismatch
+      _ -> Left $ "Rule type cannot be validated in this context"
+
+-- | Validate all enabled rules in a category against a context
+validateRulesInCategory : [Rule] -> RuleCategory -> ValidationContext -> Either Text ()
+validateRulesInCategory rules category ctx = do
+  -- Filter for enabled rules in this category
+  let relevantRules = filter (\r -> r.category == category && r.enabled) rules
+  
+  -- Validate each rule
+  let results = map (\r -> validateRule r ctx) relevantRules
+  
+  -- Return first failure, or success if all pass
+  case findLeft results of
+    Some (Left err) -> Left err
+    _ -> Right ()
+
+-- | Helper to categorize a list of rules into a Map
+categorizeRules : [Rule] -> RulesByCategory
+categorizeRules rules = 
+  foldl insertRule Map.empty rules
+  where
+    insertRule : RulesByCategory -> Rule -> RulesByCategory
+    insertRule acc rule =
+      let existing = fromOptional [] (Map.lookup rule.category acc)
+          updated = rule :: existing
+      in Map.insert rule.category updated acc
+
+-- | Helper to extract all rule IDs from a list
+extractRuleIds : [Rule] -> Set Text
+extractRuleIds rules = Set.fromList (map (\r -> r.ruleId) rules)
+
+-- | Find which category a rule belongs to by searching through the map
+findRuleInCategories : Text -> RulesByCategory -> Optional (RuleCategory, Rule)
+findRuleInCategories ruleId ruleMap =
+  let categories = Map.keys ruleMap
+      searchInCategory cat = 
+        let rulesInCat = fromOptional [] (Map.lookup cat ruleMap)
+            matchingRule = find (\r -> r.ruleId == ruleId) rulesInCat
+        in case matchingRule of
+             Some rule -> Some (cat, rule)
+             None -> None
+  in find isSome (map searchInCategory categories) >>= identity
+
+-- | Lending Pool Rule Set - Pool-specific rules
+template LendingPoolRuleSet
+  with
+    dao : Party
+    bank : Party
+    poolId : Text                           -- Links to specific lending pool
+    rulesByCategory : RulesByCategory       -- Organized by category for fast lookup
+    allRuleIds : Set Text                   -- Track all IDs for uniqueness
+    ruleIdToCategory : Map Text RuleCategory -- Fast reverse lookup
+    version : Int
+  where
+    signatory dao, bank
+    
+    key (dao, bank, poolId) : (Party, Party, Text)
+    maintainer key._2
+    
+    -- | Bank adds a new rule to the pool
+    choice AddRule : ContractId LendingPoolRuleSet
+      with
+        rule : Rule
+      controller bank
+      do
+        assertMsg "Rule ID already exists" $ not (Set.member rule.ruleId allRuleIds)
+        
+        -- Get existing rules for this category
+        let existingRules = fromOptional [] (Map.lookup rule.category rulesByCategory)
+        let newRules = rule :: existingRules
+        let newMap = Map.insert rule.category newRules rulesByCategory
+        let newIdMap = Map.insert rule.ruleId rule.category ruleIdToCategory
+        
+        create this with
+          rulesByCategory = newMap
+          allRuleIds = Set.insert rule.ruleId allRuleIds
+          ruleIdToCategory = newIdMap
+          version = version + 1
+    
+    -- | Bank updates an existing rule
+    choice UpdateRule : ContractId LendingPoolRuleSet
+      with
+        ruleId : Text
+        updatedRule : Rule
+      controller bank
+      do
+        assertMsg "Rule ID must match" $ ruleId == updatedRule.ruleId
+        assertMsg "Rule doesn't exist" $ Set.member ruleId allRuleIds
+        
+        -- Find old category from reverse lookup
+        case Map.lookup ruleId ruleIdToCategory of
+          None -> abort "Rule not found in category map"
+          Some oldCategory -> do
+            -- Remove from old category
+            let oldCategoryRules = fromOptional [] (Map.lookup oldCategory rulesByCategory)
+            let filteredOldRules = filter (\r -> r.ruleId /= ruleId) oldCategoryRules
+            let mapWithoutOld = Map.insert oldCategory filteredOldRules rulesByCategory
+            
+            -- Add to new category (might be same category)
+            let newCategory = updatedRule.category
+            let newCategoryRules = fromOptional [] (Map.lookup newCategory mapWithoutOld)
+            let newCategoryWithRule = updatedRule :: newCategoryRules
+            let finalMap = Map.insert newCategory newCategoryWithRule mapWithoutOld
+            
+            -- Update reverse lookup
+            let newIdMap = Map.insert ruleId newCategory ruleIdToCategory
+            
+            create this with
+              rulesByCategory = finalMap
+              ruleIdToCategory = newIdMap
+              version = version + 1
+    
+    -- | Bank removes a rule entirely
+    choice RemoveRule : ContractId LendingPoolRuleSet
+      with
+        ruleId : Text
+      controller bank
+      do
+        assertMsg "Rule doesn't exist" $ Set.member ruleId allRuleIds
+        
+        -- Find category from reverse lookup
+        case Map.lookup ruleId ruleIdToCategory of
+          None -> abort "Rule not found in category map"
+          Some category -> do
+            let categoryRules = fromOptional [] (Map.lookup category rulesByCategory)
+            let newRules = filter (\r -> r.ruleId /= ruleId) categoryRules
+            
+            create this with
+              rulesByCategory = Map.insert category newRules rulesByCategory
+              allRuleIds = Set.delete ruleId allRuleIds
+              ruleIdToCategory = Map.delete ruleId ruleIdToCategory
+              version = version + 1
+    
+    -- | Bank disables a rule (keeps it but marks inactive)
+    choice DisableRule : ContractId LendingPoolRuleSet
+      with
+        ruleId : Text
+      controller bank
+      do
+        assertMsg "Rule doesn't exist" $ Set.member ruleId allRuleIds
+        
+        case Map.lookup ruleId ruleIdToCategory of
+          None -> abort "Rule not found in category map"
+          Some category -> do
+            let categoryRules = fromOptional [] (Map.lookup category rulesByCategory)
+            let updatedRules = map (\r -> if r.ruleId == ruleId then r with enabled = False else r) categoryRules
+            
+            create this with
+              rulesByCategory = Map.insert category updatedRules rulesByCategory
+              version = version + 1
+    
+    -- | Bank enables a disabled rule
+    choice EnableRule : ContractId LendingPoolRuleSet
+      with
+        ruleId : Text
+      controller bank
+      do
+        assertMsg "Rule doesn't exist" $ Set.member ruleId allRuleIds
+        
+        case Map.lookup ruleId ruleIdToCategory of
+          None -> abort "Rule not found in category map"
+          Some category -> do
+            let categoryRules = fromOptional [] (Map.lookup category rulesByCategory)
+            let updatedRules = map (\r -> if r.ruleId == ruleId then r with enabled = True else r) categoryRules
+            
+            create this with
+              rulesByCategory = Map.insert category updatedRules rulesByCategory
+              version = version + 1
+    
+    -- | Non-consuming choice to validate a context against a specific category
+    nonconsuming choice ValidateCategory : Either Text ()
+      with
+        category : RuleCategory
+        context : ValidationContext
+      controller bank
+      do
+        let categoryRules = fromOptional [] (Map.lookup category rulesByCategory)
+        return $ validateRulesInCategory categoryRules category context
+    
+    -- | Non-consuming choice to get all rules in a category
+    nonconsuming choice GetRulesInCategory : [Rule]
+      with
+        category : RuleCategory
+      controller bank
+      do
+        return $ fromOptional [] (Map.lookup category rulesByCategory)
+    
+    -- | Non-consuming choice to get a specific rule
+    nonconsuming choice GetRule : Optional Rule
+      with
+        ruleId : Text
+      controller bank
+      do
+        case Map.lookup ruleId ruleIdToCategory of
+          None -> return None
+          Some category -> do
+            let categoryRules = fromOptional [] (Map.lookup category rulesByCategory)
+            return $ find (\r -> r.ruleId == ruleId) categoryRules
+
+-- | Helper to create an initial empty ruleset for a pool
+createEmptyRuleSet : Party -> Party -> Text -> Time -> Update (ContractId LendingPoolRuleSet)
+createEmptyRuleSet dao bank poolId now = do
+  create LendingPoolRuleSet
+    with
+      dao
+      bank
+      poolId
+      rulesByCategory = Map.empty
+      allRuleIds = Set.empty
+      ruleIdToCategory = Map.empty
+      version = 1
+
+-- | Helper to create a ruleset with initial rules
+createRuleSetWithRules : Party -> Party -> Text -> [Rule] -> Update (ContractId LendingPoolRuleSet)
+createRuleSetWithRules dao bank poolId initialRules = do
+  create LendingPoolRuleSet
+    with
+      dao
+      bank
+      poolId
+      rulesByCategory = categorizeRules initialRules
+      allRuleIds = extractRuleIds initialRules
+      ruleIdToCategory = foldl (\acc r -> Map.insert r.ruleId r.category acc) Map.empty initialRules
+      version = 1

@@ -1,0 +1,540 @@
+-- Loan Lifecycle Contracts
+-- Each loan has its own CollateralLock and LoanRepaymentTracker
+-- Daml 2.10.2 Compatible
+-- Canton Network Hackathon Project
+
+module LendingProtocol.Borrower.Loan where
+
+import qualified DA.Map as Map
+import DA.Set (Set)
+import DA.Optional (fromOptional)
+import LendingProtocol.Types
+import LendingProtocol.Bank.Rules
+import LendingProtocol.Bank.LendingPool
+import LendingProtocol.Bank.Pools
+import LendingProtocol.Oracle
+import LendingProtocol.Privacy
+
+-- | Status of a loan
+data LoanStatus = 
+    Pending      -- Application submitted, awaiting approval
+  | Active       -- Loan funded and active
+  | Completed    -- Fully repaid
+  | Defaulted    -- In default, subject to liquidation
+  deriving (Eq, Show)
+
+-- | Loan application submitted by borrower
+template LoanApplication
+  with
+    dao : Party
+    bank : Party
+    poolId : Text
+    borrower : Party
+    requestedAmount : Decimal
+    proposedCollateralValue : Decimal
+    proposedTermDays : Int
+    proposedInterestRate : Decimal
+    assetType : Text
+    collateralAssetType : Text
+    kycStatus : KycStatus           -- Initially KycPending
+    kycResultCid : Optional (ContractId KycResult)  -- Link to oracle result
+    creditScore : Optional Int      -- From credit bureau oracle
+    creditScoreResultCid : Optional (ContractId CreditScoreResult)
+    assetValuationCid : Optional (ContractId AssetValuation)  -- Collateral valuation
+    appliedAt : Time
+  where
+    signatory borrower, bank  -- Both sign: borrower applies, bank accepts
+    
+    key (dao, bank, poolId, borrower, appliedAt) : (Party, Party, Text, Party, Time)
+    maintainer key._2  -- Bank is maintainer
+    
+    -- | Bank requests KYC verification from oracle
+    nonconsuming choice RequestKycFromOracle : ContractId KycRequest
+      with
+        kycOracleCid : ContractId KycOracle
+        requestId : Text
+      controller bank
+      do
+        -- Request KYC from oracle
+        exercise kycOracleCid RequestKycVerification
+          with
+            bank
+            borrower
+            requestId
+    
+    -- | Bank receives KYC result from oracle and creates private KYC data
+    choice ReceiveKycResult : (ContractId LoanApplication, ContractId PrivateKYCData)
+      with
+        kycResultCid : ContractId KycResult
+        regulator : Party
+        fullName : Text
+        nationalId : Text
+        address : Text
+        phone : Text
+        email : Text
+      controller bank, borrower  -- Both must authorize since new application needs both sigs
+      do
+        kycResult <- fetch kycResultCid
+        now <- getTime
+        
+        -- Create private KYC data (only visible to bank, borrower, regulator)
+        privateKycCid <- create PrivateKYCData
+          with
+            bank
+            borrower
+            regulator
+            fullName
+            dateOfBirth = ""  -- Would be provided in production
+            nationalId
+            nationality = ""  -- Would be provided
+            residentialAddress = address
+            phoneNumber = phone
+            emailAddress = email
+            documentType = "passport"
+            documentNumber = nationalId
+            documentIssuer = "Government"
+            documentExpiry = "2030-01-01"
+            politicallyExposed = False
+            sanctionsList = False
+            adverseMediaCheck = False
+            riskLevel = "low"
+            verifiedAt = now
+            verifiedBy = bank
+            kycReference = kycResult.requestId  -- Use the requestId from fetched result
+        
+        -- Update application with KYC result
+        newApplicationCid <- create this with
+          kycStatus = if kycResult.result.verified then KycApproved else KycRejected
+          kycResultCid = Some kycResultCid
+        
+        return (newApplicationCid, privateKycCid)
+    
+    -- | Bank requests credit score from oracle
+    nonconsuming choice RequestCreditScoreFromOracle : ContractId CreditScoreRequest
+      with
+        creditOracleCid : ContractId CreditScoreOracle
+        requestId : Text
+      controller bank
+      do
+        exercise creditOracleCid RequestCreditScore
+          with
+            bank
+            borrower
+            requestId
+    
+    -- | Bank receives credit score result from oracle
+    choice ReceiveCreditScoreResult : ContractId LoanApplication
+      with
+        creditResultCid : ContractId CreditScoreResult
+      controller bank, borrower  -- Both must authorize since new application needs both sigs
+      do
+        creditResult <- fetch creditResultCid
+        
+        create this with
+          creditScore = Some creditResult.scoreData.score
+          creditScoreResultCid = Some creditResultCid
+    
+    -- | Bank/Borrower request asset valuation from oracle
+    nonconsuming choice RequestAssetValuation : ContractId AssetValuationRequest
+      with
+        valuationOracle : Party  -- The oracle party
+        requestId : Text
+        assetIdentifier : Text
+      controller bank, borrower
+      do
+        now <- getTime
+        
+        -- Create valuation request
+        create AssetValuationRequest
+          with
+            oracle = valuationOracle
+            bank
+            borrower
+            assetType = collateralAssetType
+            assetIdentifier
+            requestId
+            requestedAt = now
+    
+    -- | Bank receives asset valuation result
+    choice ReceiveAssetValuation : ContractId LoanApplication
+      with
+        valuationCid : ContractId AssetValuation
+      controller bank, borrower  -- Both must authorize since new application needs both sigs
+      do
+        valuation <- fetch valuationCid
+        
+        create this with
+          proposedCollateralValue = valuation.valuationAmount
+          assetValuationCid = Some valuationCid
+    
+    -- | Bank approves loan and funds it (ONLY if KYC approved)
+    -- Creates both private loan agreement and public summary
+    choice ApproveLoan : (ContractId ActiveLoan, ContractId CollateralLock, ContractId LoanRepaymentTracker, ContractId PrivateLoanAgreement, ContractId PublicLoanSummary)
+      with
+        lendingPoolCid : ContractId LendingPool
+        investmentPoolCid : ContractId InvestmentPool
+        ruleSetCid : ContractId LendingPoolRuleSet
+        approvedAmount : Decimal
+        approvedTermDays : Int
+        approvedInterestRate : Decimal
+        regulator : Party
+        investors : Set Party  -- For public summary
+      controller bank, borrower  -- Both must agree to loan terms
+      do
+        -- CRITICAL: KYC must be approved
+        assertMsg "KYC not approved - cannot issue loan" $ kycStatus == KycApproved
+        
+        -- Validate against borrowing rules
+        let borrowingCtx = BorrowingContext
+              with
+                borrower
+                kycVerified = True  -- We know it's true from assertion above
+                creditScore
+                loanAmount = approvedAmount
+                collateralValue = proposedCollateralValue
+                loanTermDays = approvedTermDays
+                interestRate = approvedInterestRate
+                assetType
+        
+        rules <- fetch ruleSetCid
+        let borrowingRules = fromOptional [] (Map.lookup BorrowingRules rules.rulesByCategory)
+        case validateRulesInCategory borrowingRules BorrowingRules borrowingCtx of
+          Left err -> abort $ "Borrowing validation failed: " <> err
+          Right () -> pure ()
+        
+        -- Check pool can issue loan
+        canIssue <- exercise lendingPoolCid CanIssueLoan with loanAmount = approvedAmount
+        assertMsg "Pool cannot issue loan (insufficient capital)" canIssue
+        
+        now <- getTime
+        let loanId = poolId <> "-loan-" <> show now
+        
+        -- Lock collateral
+        collateralLockCid <- create CollateralLock
+          with
+            dao
+            bank
+            poolId
+            borrower
+            loanId
+            collateralValue = proposedCollateralValue
+            collateralAssetType
+            lockedAt = now
+            isReleased = False
+        
+        -- Create repayment tracker
+        let monthlyPayment = calculateMonthlyPayment approvedAmount approvedInterestRate approvedTermDays
+        repaymentTrackerCid <- create LoanRepaymentTracker
+          with
+            dao
+            bank
+            poolId
+            borrower
+            loanId
+            principalAmount = approvedAmount
+            interestRate = approvedInterestRate
+            termDays = approvedTermDays
+            monthlyPayment
+            totalPaid = 0.0
+            principalPaid = 0.0
+            interestPaid = 0.0
+            daoFeesPaid = 0.0
+            nextPaymentDue = now  -- Would calculate actual due date
+            paymentsRemaining = (approvedTermDays / 30)  -- Rough monthly count
+        
+        -- Create PRIVATE loan agreement (only bank, borrower, regulator can see)
+        privateLoanCid <- create PrivateLoanAgreement
+          with
+            bank
+            borrower
+            regulator
+            poolId
+            loanId
+            loanAmount = approvedAmount
+            interestRate = approvedInterestRate
+            termDays = approvedTermDays
+            monthlyPayment
+            collateralType = collateralAssetType
+            collateralDescription = "Collateral for loan " <> loanId  -- Would have more details
+            collateralValue = proposedCollateralValue
+            gracePeriodDays = 5  -- Default grace period
+            prepaymentPenalty = None
+            latePaymentPenalty = 0.05  -- 5% late fee
+            specialConditions = None
+            agreedAt = now
+        
+        -- Create PUBLIC summary (investors see bucketed data, NO borrower identity)
+        publicSummaryCid <- create PublicLoanSummary
+          with
+            bank
+            investors
+            poolId
+            loanId
+            loanAmountBucket = bucketLoanAmount approvedAmount
+            interestRateBucket = bucketInterestRate approvedInterestRate
+            termBucket = bucketLoanTerm approvedTermDays
+            collateralTypeBucket = collateralAssetType
+            ltvRatioBucket = let ltv = approvedAmount / proposedCollateralValue
+                             in if ltv < 0.7 then "60-70%"
+                                else if ltv < 0.8 then "70-80%"
+                                else "80%+"
+            creditScoreBucket = case creditScore of
+                                  None -> "unknown"
+                                  Some score -> bucketCreditScore score
+            loanStatus = "active"
+            issuedAt = now
+        
+        -- Update lending pool (CRITICAL FIX: capture new lending pool CID)
+        newLendingPoolCid <- exercise lendingPoolCid RecordLoanIssuance with loanAmount = approvedAmount
+        
+        -- Create active loan with NEW lending pool CID
+        loanCid <- create ActiveLoan
+          with
+            dao
+            bank
+            poolId
+            lendingPoolCid = newLendingPoolCid  -- CRITICAL FIX: Use new lending pool CID
+            investmentPoolCid
+            borrower
+            loanId
+            loanAmount = approvedAmount
+            collateralValue = proposedCollateralValue
+            termDays = approvedTermDays
+            interestRate = approvedInterestRate
+            assetType
+            collateralAssetType
+            collateralLockCid
+            repaymentTrackerCid
+            loanStatus = Active
+            fundedAt = now
+        
+        return (loanCid, collateralLockCid, repaymentTrackerCid, privateLoanCid, publicSummaryCid)
+    
+    -- | Bank rejects loan application
+    choice RejectLoan : ()
+      with
+        reason : Text
+      controller bank
+      do
+        -- Can reject at any stage (even if KYC pending)
+        return ()
+    
+    -- | Borrower withdraws application
+    choice WithdrawApplication : ()
+      controller borrower
+      do
+        return ()
+
+-- | Active loan contract
+template ActiveLoan
+  with
+    dao : Party
+    bank : Party
+    poolId : Text
+    lendingPoolCid : ContractId LendingPool
+    investmentPoolCid : ContractId InvestmentPool
+    borrower : Party
+    loanId : Text
+    loanAmount : Decimal
+    collateralValue : Decimal
+    termDays : Int
+    interestRate : Decimal
+    assetType : Text
+    collateralAssetType : Text
+    collateralLockCid : ContractId CollateralLock
+    repaymentTrackerCid : ContractId LoanRepaymentTracker
+    loanStatus : LoanStatus
+    fundedAt : Time
+  where
+    signatory bank, borrower
+    observer dao
+    
+    key (dao, bank, poolId, loanId) : (Party, Party, Text, Text)
+    maintainer key._2
+    
+    -- | Borrower makes a payment
+    choice MakePayment : (ContractId ActiveLoan, ContractId LoanRepaymentTracker)
+      with
+        paymentAmount : Decimal
+        interestPortion : Decimal
+        principalPortion : Decimal
+      controller borrower
+      do
+        assertMsg "Loan not active" $ loanStatus == Active
+        assertMsg "Payment breakdown incorrect" $
+          (interestPortion + principalPortion) == paymentAmount
+        
+        -- Update repayment tracker
+        tracker <- fetch repaymentTrackerCid
+        archive repaymentTrackerCid
+        
+        -- Calculate DAO fee (0.5% of interest)
+        let daoFeeRate = 0.005
+        let daoFee = interestPortion * daoFeeRate
+        
+        newTrackerCid <- create tracker with
+          totalPaid = tracker.totalPaid + paymentAmount
+          principalPaid = tracker.principalPaid + principalPortion
+          interestPaid = tracker.interestPaid + interestPortion
+          daoFeesPaid = tracker.daoFeesPaid + daoFee
+          paymentsRemaining = tracker.paymentsRemaining - 1
+        
+        -- Check if loan fully repaid
+        let isFullyRepaid = tracker.principalPaid + principalPortion >= tracker.principalAmount
+        
+        if isFullyRepaid
+          then do
+            -- Update lending pool (CRITICAL FIX: capture new lending pool CID)
+            newLendingPoolCid <- exercise lendingPoolCid RecordLoanRepayment with 
+              repaymentAmount = tracker.principalAmount - tracker.principalPaid
+            
+            -- Complete the loan with new lending pool CID
+            completedLoanCid <- create this with
+              loanStatus = Completed
+              repaymentTrackerCid = newTrackerCid
+              lendingPoolCid = newLendingPoolCid  -- CRITICAL FIX
+            
+            -- Release collateral
+            exercise collateralLockCid ReleaseCollateral
+            
+            return (completedLoanCid, newTrackerCid)
+          else do
+            -- Update lending pool with principal portion (CRITICAL FIX: capture new lending pool CID)
+            newLendingPoolCid <- exercise lendingPoolCid RecordLoanRepayment with 
+              repaymentAmount = principalPortion
+            
+            -- Continue loan with new lending pool CID
+            newLoanCid <- create this with
+              repaymentTrackerCid = newTrackerCid
+              lendingPoolCid = newLendingPoolCid  -- CRITICAL FIX
+            
+            return (newLoanCid, newTrackerCid)
+    
+    -- | Bank marks loan as defaulted
+    choice MarkDefaulted : ContractId ActiveLoan
+      controller bank
+      do
+        assertMsg "Loan already completed or defaulted" $ loanStatus == Active
+        
+        create this with
+          loanStatus = Defaulted
+    
+    -- | Liquidate defaulted loan (seize collateral)
+    choice LiquidateLoan : ()
+      with
+        bankPortion : Decimal
+        investorPortion : Decimal
+      controller bank
+      do
+        assertMsg "Can only liquidate defaulted loans" $ loanStatus == Defaulted
+        assertMsg "Distribution exceeds collateral" $
+          (bankPortion + investorPortion) <= collateralValue
+        
+        -- Mark collateral as liquidated
+        exercise collateralLockCid MarkLiquidated
+        
+        -- Update lending pool (write off remaining principal)
+        tracker <- fetch repaymentTrackerCid
+        let remainingPrincipal = tracker.principalAmount - tracker.principalPaid
+        exercise lendingPoolCid RecordLoanRepayment with 
+          repaymentAmount = remainingPrincipal
+        
+        -- Distribute collateral (simplified for MVP)
+        return ()
+
+-- | Collateral lock for a specific loan
+template CollateralLock
+  with
+    dao : Party
+    bank : Party
+    poolId : Text
+    borrower : Party
+    loanId : Text
+    collateralValue : Decimal
+    collateralAssetType : Text
+    lockedAt : Time
+    isReleased : Bool
+  where
+    signatory bank, borrower
+    observer dao
+    
+    key (dao, bank, poolId, loanId) : (Party, Party, Text, Text)
+    maintainer key._2
+    
+    -- | Release collateral back to borrower (loan completed)
+    choice ReleaseCollateral : ()
+      controller bank
+      do
+        assertMsg "Collateral already released" $ not isReleased
+        -- Collateral returned to borrower
+        return ()
+    
+    -- | Mark collateral as liquidated (loan defaulted)
+    choice MarkLiquidated : ContractId CollateralLock
+      controller bank
+      do
+        create this with isReleased = True
+
+-- | Repayment tracker for a specific loan
+template LoanRepaymentTracker
+  with
+    dao : Party
+    bank : Party
+    poolId : Text
+    borrower : Party
+    loanId : Text
+    principalAmount : Decimal
+    interestRate : Decimal
+    termDays : Int
+    monthlyPayment : Decimal
+    totalPaid : Decimal
+    principalPaid : Decimal
+    interestPaid : Decimal
+    daoFeesPaid : Decimal
+    nextPaymentDue : Time
+    paymentsRemaining : Int
+  where
+    signatory bank, borrower
+    observer dao
+    
+    key (dao, bank, poolId, loanId) : (Party, Party, Text, Text)
+    maintainer key._2
+    
+    -- | Non-consuming choice to get loan payment status
+    nonconsuming choice GetPaymentStatus : PaymentStatus
+      controller bank
+      do
+        return PaymentStatus
+          with
+            totalOwed = principalAmount
+            totalPaid
+            principalRemaining = principalAmount - principalPaid
+            interestPaid
+            daoFeesPaid
+            nextPaymentDue
+            paymentsRemaining
+
+-- | Payment status for reporting
+data PaymentStatus = PaymentStatus
+  with
+    totalOwed : Decimal
+    totalPaid : Decimal
+    principalRemaining : Decimal
+    interestPaid : Decimal
+    daoFeesPaid : Decimal
+    nextPaymentDue : Time
+    paymentsRemaining : Int
+  deriving (Eq, Show)
+
+-- ============================================================================
+-- HELPER FUNCTIONS
+-- ============================================================================
+
+-- | Calculate monthly payment (simplified)
+-- In production, would use proper amortization formula
+calculateMonthlyPayment : Decimal -> Decimal -> Int -> Decimal
+calculateMonthlyPayment principal rate termDays =
+  let months = intToDecimal (termDays / 30)
+      totalInterest = principal * rate * (intToDecimal termDays / 365.0)
+      totalAmount = principal + totalInterest
+  in totalAmount / months

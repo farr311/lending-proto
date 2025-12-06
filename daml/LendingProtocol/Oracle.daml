@@ -1,0 +1,445 @@
+-- Oracle System for External Data Feeds
+-- Daml 2.10.2 Compatible
+-- Canton Network Hackathon Project
+
+module LendingProtocol.Oracle where
+
+import DA.Map (Map)
+import qualified DA.Map as Map
+import DA.Set (Set)
+import qualified DA.Set as Set
+
+-- ============================================================================
+-- KYC ORACLE - Identity Verification
+-- ============================================================================
+
+-- | KYC verification status from oracle
+data KycVerificationResult = KycVerificationResult
+  with
+    verified : Bool
+    riskScore : Int              -- 0-100, higher = riskier
+    verificationType : Text      -- "passport", "drivers_license", etc.
+    verificationDate : Time
+    expiryDate : Optional Time
+  deriving (Eq, Show)
+
+-- | KYC Oracle - Third-party identity verification
+template KycOracle
+  with
+    oracle : Party               -- KYC service provider (Jumio, Chainalysis, etc.)
+    supportedBanks : Set Party   -- Banks authorized to use this oracle
+    serviceName : Text           -- "Jumio KYC", "Chainalysis KYC", etc.
+  where
+    signatory oracle
+    observer supportedBanks
+    
+    key oracle : Party
+    maintainer key
+    
+    -- | Bank requests KYC verification for a borrower
+    nonconsuming choice RequestKycVerification : ContractId KycRequest
+      with
+        bank : Party
+        borrower : Party
+        requestId : Text
+      controller bank
+      do
+        assertMsg "Bank not authorized" $ Set.member bank supportedBanks
+        
+        now <- getTime
+        create KycRequest
+          with
+            oracle
+            bank
+            borrower
+            requestId
+            requestedAt = now
+            status = "pending"
+
+-- | KYC request submitted by bank
+template KycRequest
+  with
+    oracle : Party
+    bank : Party
+    borrower : Party
+    requestId : Text
+    requestedAt : Time
+    status : Text                -- "pending", "completed", "failed"
+  where
+    signatory bank
+    observer oracle, borrower
+    
+    key (oracle, bank, requestId) : (Party, Party, Text)
+    maintainer key._2
+    
+    -- | Oracle provides KYC result
+    choice ProvideKycResult : ContractId KycResult
+      with
+        result : KycVerificationResult
+      controller oracle, bank  -- Both must authorize since both are signatories on result
+      do
+        now <- getTime
+        create KycResult
+          with
+            oracle
+            bank
+            borrower
+            requestId
+            result
+            verifiedAt = now
+
+-- | KYC verification result
+template KycResult
+  with
+    oracle : Party
+    bank : Party
+    borrower : Party
+    requestId : Text
+    result : KycVerificationResult
+    verifiedAt : Time
+  where
+    signatory oracle, bank  -- Bank must be signatory since it's the key maintainer
+    observer borrower
+    
+    key (oracle, bank, borrower, requestId) : (Party, Party, Party, Text)
+    maintainer key._2  -- Bank is maintainer, so must be signatory
+
+-- ============================================================================
+-- CREDIT SCORE ORACLE - Creditworthiness Assessment
+-- ============================================================================
+
+-- | Credit score data from bureau
+data CreditScoreData = CreditScoreData
+  with
+    score : Int                  -- e.g., 300-850 (FICO)
+    scoreModel : Text            -- "FICO", "VantageScore", etc.
+    riskCategory : Text          -- "excellent", "good", "fair", "poor"
+    reportDate : Time
+  deriving (Eq, Show)
+
+-- | Credit Score Oracle - Credit bureau integration
+template CreditScoreOracle
+  with
+    oracle : Party               -- Credit bureau (Experian, Equifax, etc.)
+    supportedBanks : Set Party
+    bureauName : Text            -- "Experian", "FICO", etc.
+  where
+    signatory oracle
+    observer supportedBanks
+    
+    key oracle : Party
+    maintainer key
+    
+    -- | Bank requests credit score for borrower
+    nonconsuming choice RequestCreditScore : ContractId CreditScoreRequest
+      with
+        bank : Party
+        borrower : Party
+        requestId : Text
+      controller bank
+      do
+        assertMsg "Bank not authorized" $ Set.member bank supportedBanks
+        
+        now <- getTime
+        create CreditScoreRequest
+          with
+            oracle
+            bank
+            borrower
+            requestId
+            requestedAt = now
+
+-- | Credit score request
+template CreditScoreRequest
+  with
+    oracle : Party
+    bank : Party
+    borrower : Party
+    requestId : Text
+    requestedAt : Time
+  where
+    signatory bank
+    observer oracle, borrower
+    
+    key (oracle, bank, requestId) : (Party, Party, Text)
+    maintainer key._2
+    
+    -- | Oracle provides credit score
+    choice ProvideCreditScore : ContractId CreditScoreResult
+      with
+        scoreData : CreditScoreData
+      controller oracle, bank  -- Both must authorize since both are signatories on result
+      do
+        now <- getTime
+        create CreditScoreResult
+          with
+            oracle
+            bank
+            borrower
+            requestId
+            scoreData
+            providedAt = now
+
+-- | Credit score result
+template CreditScoreResult
+  with
+    oracle : Party
+    bank : Party
+    borrower : Party
+    requestId : Text
+    scoreData : CreditScoreData
+    providedAt : Time
+  where
+    signatory oracle, bank  -- Bank must be signatory since it's the key maintainer
+    observer borrower
+    
+    key (oracle, bank, borrower, requestId) : (Party, Party, Party, Text)
+    maintainer key._2  -- Bank is maintainer, so must be signatory
+
+-- ============================================================================
+-- ASSET PRICE ORACLE - Real-time Asset Valuation
+-- ============================================================================
+
+-- | Asset price feed
+template AssetPriceOracle
+  with
+    oracle : Party               -- Price feed provider (Chainlink, etc.)
+    assetType : Text             -- "BTC", "ETH", "REAL_ESTATE", etc.
+    currentPrice : Decimal       -- Price in USDT
+    lastUpdated : Time
+    confidence : Decimal         -- 0.0-1.0, confidence in price accuracy
+  where
+    signatory oracle
+    
+    key (oracle, assetType) : (Party, Text)
+    maintainer key._1
+    
+    -- | Oracle updates asset price
+    choice UpdatePrice : ContractId AssetPriceOracle
+      with
+        newPrice : Decimal
+        newConfidence : Decimal
+      controller oracle
+      do
+        now <- getTime
+        create this with
+          currentPrice = newPrice
+          lastUpdated = now
+          confidence = newConfidence
+    
+    -- | Non-consuming: Get current price
+    nonconsuming choice GetCurrentPrice : (Decimal, Time)
+      controller oracle
+      do
+        return (currentPrice, lastUpdated)
+
+-- | Asset valuation request (for complex assets like real estate)
+template AssetValuationRequest
+  with
+    oracle : Party
+    bank : Party
+    borrower : Party
+    assetType : Text
+    assetIdentifier : Text       -- Property address, VIN, etc.
+    requestId : Text
+    requestedAt : Time
+  where
+    signatory bank, borrower
+    observer oracle
+    
+    key (oracle, bank, requestId) : (Party, Party, Text)
+    maintainer key._2
+    
+    -- | Oracle provides valuation
+    choice ProvideValuation : ContractId AssetValuation
+      with
+        valuationAmount : Decimal
+        valuationMethod : Text   -- "automated", "manual_appraisal", etc.
+        confidence : Decimal
+      controller oracle, bank  -- Both must authorize since both are signatories on result
+      do
+        now <- getTime
+        create AssetValuation
+          with
+            oracle
+            bank
+            borrower
+            assetType
+            assetIdentifier
+            requestId
+            valuationAmount
+            valuationMethod
+            confidence
+            valuedAt = now
+
+-- | Asset valuation result
+template AssetValuation
+  with
+    oracle : Party
+    bank : Party
+    borrower : Party
+    assetType : Text
+    assetIdentifier : Text
+    requestId : Text
+    valuationAmount : Decimal
+    valuationMethod : Text
+    confidence : Decimal
+    valuedAt : Time
+  where
+    signatory oracle, bank  -- Bank must be signatory since it's the key maintainer
+    observer borrower
+    
+    key (oracle, bank, borrower, requestId) : (Party, Party, Party, Text)
+    maintainer key._2  -- Bank is maintainer, so must be signatory
+
+-- ============================================================================
+-- INTEREST RATE ORACLE - Market Interest Rates
+-- ============================================================================
+
+-- | Interest rate benchmark feed
+template InterestRateOracle
+  with
+    oracle : Party               -- Rate provider (Federal Reserve, etc.)
+    benchmarkName : Text         -- "SOFR", "LIBOR", "Fed Funds Rate", etc.
+    currentRate : Decimal        -- Annual rate (e.g., 0.05 = 5%)
+    lastUpdated : Time
+    rateType : Text              -- "overnight", "1month", "3month", "1year"
+  where
+    signatory oracle
+    
+    key (oracle, benchmarkName, rateType) : (Party, Text, Text)
+    maintainer key._1
+    
+    -- | Oracle updates interest rate
+    choice UpdateRate : ContractId InterestRateOracle
+      with
+        newRate : Decimal
+      controller oracle
+      do
+        now <- getTime
+        create this with
+          currentRate = newRate
+          lastUpdated = now
+    
+    -- | Non-consuming: Get current rate
+    nonconsuming choice GetCurrentRate : (Decimal, Time)
+      controller oracle
+      do
+        return (currentRate, lastUpdated)
+
+-- | Interest rate calculation for a loan
+-- Banks can use this to calculate dynamic rates based on benchmark + spread
+data InterestRateCalculation = InterestRateCalculation
+  with
+    benchmarkRate : Decimal      -- e.g., SOFR at 4.5%
+    spreadRate : Decimal         -- e.g., 2.5% (bank's margin)
+    totalRate : Decimal          -- 7.0% total
+    calculatedAt : Time
+  deriving (Eq, Show)
+
+-- ============================================================================
+-- LIQUIDATION THRESHOLD ORACLE - Risk Management
+-- ============================================================================
+
+-- | Liquidation threshold calculator
+-- Determines when collateral becomes insufficient
+template LiquidationThresholdOracle
+  with
+    oracle : Party
+    ltvThresholds : Map Text Decimal  -- Asset type -> Max LTV ratio
+                                      -- e.g., "BTC" -> 0.7 (70% max)
+                                      -- "REAL_ESTATE" -> 0.8 (80% max)
+  where
+    signatory oracle
+    
+    key oracle : Party
+    maintainer key
+    
+    -- | Update LTV thresholds based on market conditions
+    choice UpdateThresholds : ContractId LiquidationThresholdOracle
+      with
+        newThresholds : Map Text Decimal
+      controller oracle
+      do
+        create this with ltvThresholds = newThresholds
+    
+    -- | Non-consuming: Check if loan should be liquidated
+    nonconsuming choice CheckLiquidationStatus : LiquidationStatus
+      with
+        assetType : Text
+        collateralValue : Decimal
+        loanAmount : Decimal
+      controller oracle
+      do
+        let currentLtv = loanAmount / collateralValue
+        let threshold = case Map.lookup assetType ltvThresholds of
+              None -> 0.8  -- Default 80% threshold
+              Some t -> t
+        
+        let shouldLiquidate = currentLtv > threshold
+        let healthFactor = threshold / currentLtv  -- >1 is healthy, <1 needs liquidation
+        
+        return LiquidationStatus
+          with
+            shouldLiquidate
+            currentLtv
+            threshold
+            healthFactor
+
+-- | Liquidation status assessment
+data LiquidationStatus = LiquidationStatus
+  with
+    shouldLiquidate : Bool
+    currentLtv : Decimal         -- Current loan-to-value ratio
+    threshold : Decimal          -- Maximum allowed LTV
+    healthFactor : Decimal       -- >1 = healthy, <1 = danger zone
+  deriving (Eq, Show)
+
+-- ============================================================================
+-- HELPER FUNCTIONS
+-- ============================================================================
+
+-- | Create default oracle setup for a bank
+createOracleSetup : Party -> Party -> Party -> Party -> Party -> Update (ContractId KycOracle, ContractId CreditScoreOracle, ContractId AssetPriceOracle, ContractId InterestRateOracle, ContractId LiquidationThresholdOracle)
+createOracleSetup kycProvider creditBureau priceProvider rateProvider riskOracle = do
+  kycOracleCid <- create KycOracle
+    with
+      oracle = kycProvider
+      supportedBanks = Set.empty
+      serviceName = "KYC Verification Service"
+  
+  creditOracleCid <- create CreditScoreOracle
+    with
+      oracle = creditBureau
+      supportedBanks = Set.empty
+      bureauName = "Credit Bureau"
+  
+  now <- getTime
+  
+  priceOracleCid <- create AssetPriceOracle
+    with
+      oracle = priceProvider
+      assetType = "BTC"
+      currentPrice = 45000.0
+      lastUpdated = now
+      confidence = 0.95
+  
+  rateOracleCid <- create InterestRateOracle
+    with
+      oracle = rateProvider
+      benchmarkName = "SOFR"
+      currentRate = 0.045
+      lastUpdated = now
+      rateType = "overnight"
+  
+  liquidationOracleCid <- create LiquidationThresholdOracle
+    with
+      oracle = riskOracle
+      ltvThresholds = Map.fromList
+        [ ("BTC", 0.7)
+        , ("ETH", 0.65)
+        , ("REAL_ESTATE", 0.8)
+        , ("SECURITIES", 0.75)
+        ]
+  
+  return (kycOracleCid, creditOracleCid, priceOracleCid, rateOracleCid, liquidationOracleCid)
